@@ -598,6 +598,7 @@ export const router = (authToken?: string) => {
             llmDebugLogs: config.llmDebugLogs === true,
             eventSoundSettings: config.eventSoundSettings,
             onePasswordAccountName: config.onePasswordAccountName ?? null,
+            eventSoundSettings: config.eventSoundSettings,
           };
         }),
       onConfigChanged: t
