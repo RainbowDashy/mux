@@ -596,6 +596,7 @@ export const router = (authToken?: string) => {
             muxGovernorUrl,
             muxGovernorEnrolled,
             llmDebugLogs: config.llmDebugLogs === true,
+            eventSoundSettings: config.eventSoundSettings,
             onePasswordAccountName: config.onePasswordAccountName ?? null,
           };
         }),
@@ -962,6 +963,23 @@ export const router = (authToken?: string) => {
           await context.config.editConfig((config) => {
             config.llmDebugLogs = input.enabled;
             return config;
+          });
+        }),
+      updateEventSoundSettings: t
+        .input(schemas.config.updateEventSoundSettings.input)
+        .output(schemas.config.updateEventSoundSettings.output)
+        .handler(async ({ context, input }) => {
+          await context.config.editConfig((config) => {
+            const nextSettings = input.eventSoundSettings;
+            if (!nextSettings || Object.keys(nextSettings).length === 0) {
+              const { eventSoundSettings: _eventSoundSettings, ...rest } = config;
+              return rest;
+            }
+
+            return {
+              ...config,
+              eventSoundSettings: nextSettings,
+            };
           });
         }),
       unenrollMuxGovernor: t
