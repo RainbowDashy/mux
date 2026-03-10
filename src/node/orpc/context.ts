@@ -37,6 +37,7 @@ import type { AnalyticsService } from "@/node/services/analytics/analyticsServic
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
+import type { EventSoundAssetService } from "@/node/services/eventSoundAssetService";
 
 export interface ORPCContext {
   config: Config;
@@ -77,5 +78,6 @@ export interface ORPCContext {
   desktopSessionManager: DesktopSessionManager;
   desktopTokenManager: DesktopTokenManager;
   desktopBridgeServer: DesktopBridgeServer;
+  eventSoundAssetService: EventSoundAssetService;
   headers?: IncomingHttpHeaders;
 }

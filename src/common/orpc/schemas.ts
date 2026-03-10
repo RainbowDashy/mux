@@ -213,6 +213,7 @@ export {
   CoderWorkspaceStatusSchema,
   config,
   browserSession,
+  eventSounds,
   devtools,
   uiLayouts,
   debug,
