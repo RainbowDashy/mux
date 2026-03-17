@@ -64,6 +64,7 @@ export class WorktreeManager {
   async createWorkspace(params: {
     projectPath: string;
     branchName: string;
+    directoryName?: string;
     trunkBranch: string;
     initLogger: InitLogger;
     abortSignal?: AbortSignal;
@@ -73,7 +74,8 @@ export class WorktreeManager {
     const { projectPath, branchName, trunkBranch, initLogger } = params;
     // Disable git hooks for untrusted projects (prevents post-checkout execution)
     const noHooksEnv = this.getGitExecOptions(params.trusted);
-    const workspacePath = this.getWorkspacePath(projectPath, branchName);
+    const workspaceName = params.directoryName ?? branchName;
+    const workspacePath = this.getWorkspacePath(projectPath, workspaceName);
     let worktreeCreated = false;
     let createdBranch = false;
 
@@ -486,9 +488,13 @@ export class WorktreeManager {
     // These are direct workspace directories (e.g., CLI/benchmark sessions), not git worktrees.
     const isInPlace = projectPath === workspaceName;
     const deletedPath = this.getWorkspacePath(projectPath, workspaceName);
+    const branchName = isInPlace
+      ? null
+      : await this.resolveWorkspaceBranchName(projectPath, deletedPath, noHooksEnv);
     const branchDeleteArgs = {
       projectPath,
       workspaceName,
+      branchName,
       force,
       isInPlace,
       noHooksEnv,
@@ -542,9 +548,59 @@ export class WorktreeManager {
     }
   }
 
+  private async resolveWorkspaceBranchName(
+    projectPath: string,
+    workspacePath: string,
+    noHooksEnv: GitExecOptions
+  ): Promise<string | null> {
+    try {
+      using worktreeProc = execFileAsync(
+        "git",
+        ["-C", projectPath, "worktree", "list", "--porcelain"],
+        noHooksEnv
+      );
+      const { stdout } = await worktreeProc.result;
+      const resolvedWorkspacePath = path.resolve(workspacePath);
+      const workspaceBlock = stdout.split("\n\n").find((block) => {
+        return block.split("\n").some((line) => {
+          if (!line.startsWith("worktree ")) {
+            return false;
+          }
+          return path.resolve(line.slice("worktree ".length).trim()) === resolvedWorkspacePath;
+        });
+      });
+      const branchLine = workspaceBlock
+        ?.split("\n")
+        .find((line) => line.startsWith("branch refs/heads/"));
+      if (branchLine) {
+        return branchLine.slice("branch refs/heads/".length).trim() || null;
+      }
+    } catch (error) {
+      log.debug("Failed to resolve workspace branch from worktree metadata", {
+        projectPath,
+        workspacePath,
+        error: getErrorMessage(error),
+      });
+    }
+
+    try {
+      using branchProc = execFileAsync(
+        "git",
+        ["-C", workspacePath, "branch", "--show-current"],
+        noHooksEnv
+      );
+      const { stdout } = await branchProc.result;
+      const branchName = stdout.trim();
+      return branchName || null;
+    } catch {
+      return null;
+    }
+  }
+
   private async deleteWorkspaceBranchIfSafe(args: {
     projectPath: string;
     workspaceName: string;
+    branchName: string | null;
     force: boolean;
     isInPlace: boolean;
     noHooksEnv: GitExecOptions;
@@ -555,9 +611,9 @@ export class WorktreeManager {
       return;
     }
 
-    const branchToDelete = args.workspaceName.trim();
+    const branchToDelete = args.branchName?.trim();
     if (!branchToDelete) {
-      log.debug("Skipping git branch deletion: empty workspace name", {
+      log.debug("Skipping git branch deletion: workspace branch is unknown", {
         projectPath: args.projectPath,
         workspaceName: args.workspaceName,
       });
@@ -731,6 +787,7 @@ export class WorktreeManager {
       const createResult = await this.createWorkspace({
         projectPath,
         branchName: newWorkspaceName,
+        directoryName: newWorkspaceName,
         trunkBranch: sourceBranch, // Fork from source branch instead of main/master
         initLogger,
         abortSignal: params.abortSignal,

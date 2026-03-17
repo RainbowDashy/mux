@@ -32,12 +32,7 @@ import type {
 import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
 import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { log } from "@/node/services/log";
-import {
-  checkInitHookExists,
-  getMuxEnv,
-  runInitHookOnRuntime,
-  shouldSkipInitHook,
-} from "./initHook";
+import { runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
 import { expandTildeForSSH as expandHookPath } from "./tildeExpansion";
 
 import { expandTildeForSSH, cdCommandForSSH } from "./tildeExpansion";
@@ -407,6 +402,27 @@ export class SSHRuntime extends RemoteRuntime {
     return result.exitCode === 0;
   }
 
+  private async resolveCheckedOutBranch(
+    workspacePath: string,
+    abortSignal?: AbortSignal
+  ): Promise<string | null> {
+    try {
+      const branchResult = await execBuffered(
+        this,
+        `git -C ${this.quoteForRemote(workspacePath)} branch --show-current`,
+        {
+          cwd: "/tmp",
+          timeout: 10,
+          abortSignal,
+        }
+      );
+      const branchName = branchResult.stdout.trim();
+      return branchResult.exitCode === 0 && branchName.length > 0 ? branchName : null;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Resolve the bundle staging ref for the trunk branch.
    * Returns refs/mux-bundle/<trunkBranch> if it exists, otherwise falls back
@@ -752,9 +768,9 @@ export class SSHRuntime extends RemoteRuntime {
 
   async createWorkspace(params: WorkspaceCreationParams): Promise<WorkspaceCreationResult> {
     try {
-      const { projectPath, branchName, initLogger, abortSignal } = params;
-      // Compute workspace path using canonical method
-      const workspacePath = this.getWorkspacePath(projectPath, branchName);
+      const { projectPath, directoryName, initLogger, abortSignal } = params;
+      // Workspace directories follow the persisted workspace name; branch checkout happens later.
+      const workspacePath = this.getWorkspacePath(projectPath, directoryName);
 
       // Prepare parent directory for git clone (fast - returns immediately)
       // Note: git clone will create the workspace directory itself during initWorkspace,
@@ -805,49 +821,29 @@ export class SSHRuntime extends RemoteRuntime {
   }
 
   async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
-    const { projectPath, branchName, workspacePath, initLogger, abortSignal, env } = params;
-
     // Disable git hooks for untrusted projects (prevents post-checkout execution)
     const nhp = gitNoHooksPrefix(params.trusted);
 
-    try {
-      await this.prepareWorkspaceCheckout(params, nhp);
-
-      // 3. Run .mux/init hook if it exists
-      // Note: runInitHookOnRuntime calls logComplete() internally
-      if (shouldSkipInitHook(params, initLogger)) {
-        initLogger.logComplete(0);
-      } else {
-        const hookExists = await checkInitHookExists(projectPath);
-        if (hookExists) {
-          initLogger.enterHookPhase?.();
-          const muxEnv = { ...env, ...getMuxEnv(projectPath, "ssh", branchName) };
-          // Expand tilde in hook path (quoted paths don't auto-expand on remote)
-          const hookPath = expandHookPath(`${workspacePath}/.mux/init`);
-          await runInitHookOnRuntime(
-            this,
-            hookPath,
-            workspacePath,
-            muxEnv,
-            initLogger,
-            abortSignal
-          );
-        } else {
-          // No hook - signal completion immediately
-          initLogger.logComplete(0);
-        }
-      }
-
-      return { success: true };
-    } catch (error) {
-      const errorMsg = getErrorMessage(error);
-      initLogger.logStderr(`Initialization failed: ${errorMsg}`);
-      initLogger.logComplete(-1);
-      return {
-        success: false,
-        error: errorMsg,
-      };
-    }
+    return runWorkspaceInitHook({
+      params,
+      runtimeType: "ssh",
+      hookCheckPath: params.projectPath,
+      beforeHook: async () => {
+        await this.prepareWorkspaceCheckout(params, nhp);
+      },
+      runHook: async ({ muxEnv, initLogger, abortSignal }) => {
+        // Expand tilde in hook path (quoted paths don't auto-expand on remote).
+        const hookPath = expandHookPath(`${params.workspacePath}/.mux/init`);
+        await runInitHookOnRuntime(
+          this,
+          hookPath,
+          params.workspacePath,
+          muxEnv,
+          initLogger,
+          abortSignal
+        );
+      },
+    });
   }
 
   private async prepareWorkspaceCheckout(params: WorkspaceInitParams, nhp: string): Promise<void> {
@@ -1355,6 +1351,8 @@ export class SSHRuntime extends RemoteRuntime {
         };
       }
 
+      const branchToDelete = await this.resolveCheckedOutBranch(deletedPath, abortSignal);
+
       // Detect if workspace is a worktree (.git is a file) vs a legacy full clone (.git is a directory).
       const isWorktree = await this.isWorktreeWorkspace(deletedPath, abortSignal);
 
@@ -1399,10 +1397,10 @@ export class SSHRuntime extends RemoteRuntime {
         // path (git worktree add -b fails if the branch already exists).
         // Skip protected trunk branch names to avoid accidental deletion.
         const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
-        if (!PROTECTED_BRANCHES.includes(workspaceName)) {
+        if (branchToDelete && !PROTECTED_BRANCHES.includes(branchToDelete)) {
           await execBuffered(
             this,
-            `${nhp}git -C ${baseRepoPathArg} branch -D ${shescape.quote(workspaceName)} 2>/dev/null || true`,
+            `${nhp}git -C ${baseRepoPathArg} branch -D ${shescape.quote(branchToDelete)} 2>/dev/null || true`,
             { cwd: "/tmp", timeout: 10 }
           ).catch(() => undefined);
         }

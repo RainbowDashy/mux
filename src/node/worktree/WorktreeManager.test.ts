@@ -150,6 +150,40 @@ describe("WorktreeManager.createWorkspace", () => {
       20_000
     );
   }
+  it("uses directoryName for the workspace path while checking out the requested branch", async () => {
+    const fixture = await createCreateWorkspaceFixture();
+    const branchName = "feature-branch";
+    const directoryName = "review-slot";
+
+    try {
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        directoryName,
+        trunkBranch: "main",
+        initLogger: fixture.initLogger,
+        trusted: true,
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) {
+        throw new Error("Expected createWorkspace to return a workspace path");
+      }
+
+      expect(result.workspacePath).toBe(
+        fixture.manager.getWorkspacePath(fixture.projectPath, directoryName)
+      );
+      const checkedOutBranch = execSync("git branch --show-current", {
+        cwd: result.workspacePath,
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim();
+      expect(checkedOutBranch).toBe(branchName);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
 });
 
 describe("WorktreeManager.deleteWorkspace", () => {
@@ -274,6 +308,60 @@ describe("WorktreeManager.deleteWorkspace", () => {
     } finally {
       execFileAsyncSpy?.mockRestore();
       await fsPromises.rm(sentinelPath, { force: true });
+      await fsPromises.rm(rootDir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("deletes the checked-out branch instead of the workspace directory name", async () => {
+    const rootDir = await fsPromises.realpath(
+      await fsPromises.mkdtemp(path.join(os.tmpdir(), "worktree-manager-delete-"))
+    );
+
+    try {
+      const projectPath = path.join(rootDir, "repo");
+      await fsPromises.mkdir(projectPath, { recursive: true });
+      initGitRepo(projectPath);
+
+      const srcBaseDir = path.join(rootDir, "src");
+      await fsPromises.mkdir(srcBaseDir, { recursive: true });
+
+      const manager = new WorktreeManager(srcBaseDir);
+      const initLogger = createNullInitLogger();
+
+      const branchName = "feature-dir-split";
+      const directoryName = "review-slot";
+      const createResult = await manager.createWorkspace({
+        projectPath,
+        branchName,
+        directoryName,
+        trunkBranch: "main",
+        initLogger,
+        trusted: true,
+      });
+      expect(createResult.success).toBe(true);
+      if (!createResult.success) return;
+
+      execSync(`git branch ${directoryName}`, { cwd: projectPath, stdio: "ignore" });
+
+      const deleteResult = await manager.deleteWorkspace(projectPath, directoryName, true);
+      expect(deleteResult.success).toBe(true);
+
+      const featureBranchAfter = execSync(`git branch --list "${branchName}"`, {
+        cwd: projectPath,
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim();
+      expect(featureBranchAfter).toBe("");
+
+      const directoryBranchAfter = execSync(`git branch --list "${directoryName}"`, {
+        cwd: projectPath,
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim();
+      expect(directoryBranchAfter).toBe(directoryName);
+    } finally {
       await fsPromises.rm(rootDir, { recursive: true, force: true });
     }
   }, 20_000);

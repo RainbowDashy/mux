@@ -35,6 +35,104 @@ describe("SSHRuntime constructor", () => {
   });
 });
 
+describe("SSHRuntime.createWorkspace", () => {
+  it("uses directoryName for the workspace path while preparing the remote parent directory", async () => {
+    const config = { host: "example.com", srcBaseDir: "/home/user/src" };
+    const runtime = new SSHRuntime(config, createSSHTransport(config, false));
+    const execSpy = spyOn(runtime, "exec").mockResolvedValue({
+      stdout: new ReadableStream<Uint8Array>(),
+      stderr: new ReadableStream<Uint8Array>(),
+      stdin: new WritableStream<Uint8Array>(),
+      exitCode: Promise.resolve(0),
+      duration: Promise.resolve(0),
+    });
+
+    try {
+      const result = await runtime.createWorkspace({
+        projectPath: "/projects/demo",
+        branchName: "feature-branch",
+        directoryName: "review-slot",
+        trunkBranch: "main",
+        initLogger: {
+          logStep: () => undefined,
+          logStdout: () => undefined,
+          logStderr: () => undefined,
+          logComplete: () => undefined,
+        },
+      });
+
+      expect(result).toEqual({
+        success: true,
+        workspacePath: "/home/user/src/demo/review-slot",
+      });
+      expect(execSpy).toHaveBeenCalledWith('mkdir -p "/home/user/src/demo"', {
+        cwd: "/tmp",
+        timeout: 10,
+        abortSignal: undefined,
+      });
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+});
+
+describe("SSHRuntime.deleteWorkspace", () => {
+  function createExecStream(exitCode: number) {
+    return {
+      stdout: new ReadableStream<Uint8Array>(),
+      stderr: new ReadableStream<Uint8Array>(),
+      stdin: new WritableStream<Uint8Array>(),
+      exitCode: Promise.resolve(exitCode),
+      duration: Promise.resolve(0),
+    };
+  }
+
+  it("deletes the checked-out branch instead of the workspace directory name for worktrees", async () => {
+    const config = { host: "example.com", srcBaseDir: "/home/user/src" };
+    const runtime = new SSHRuntime(config, createSSHTransport(config, false));
+    const execSpy = spyOn(runtime, "exec").mockImplementation((command) => {
+      if (command.includes("git diff --quiet") || command.includes("test -d")) {
+        return Promise.resolve(createExecStream(0));
+      }
+      if (command.includes("worktree remove")) {
+        return Promise.resolve(createExecStream(0));
+      }
+      throw new Error(`Unexpected exec command: ${command}`);
+    });
+    const execBufferedSpy = spyOn(runtimeHelpers, "execBuffered").mockImplementation(
+      (_runtime, command) => {
+        if (command.startsWith("git -C /home/user/src/demo/review-slot branch --show-current")) {
+          return Promise.resolve({
+            stdout: "feature-branch\n",
+            stderr: "",
+            exitCode: 0,
+            duration: 0,
+          });
+        }
+        if (command.startsWith("test -f ")) {
+          return Promise.resolve({ stdout: "", stderr: "", exitCode: 0, duration: 0 });
+        }
+        if (command.includes(" branch -D ")) {
+          expect(command).toContain("feature-branch");
+          return Promise.resolve({ stdout: "", stderr: "", exitCode: 0, duration: 0 });
+        }
+        throw new Error(`Unexpected execBuffered command: ${command}`);
+      }
+    );
+
+    try {
+      const result = await runtime.deleteWorkspace("/projects/demo", "review-slot", true);
+      expect(result).toEqual({
+        success: true,
+        deletedPath: "/home/user/src/demo/review-slot",
+      });
+    } finally {
+      execSpy.mockRestore();
+      execBufferedSpy.mockRestore();
+    }
+  });
+});
+
 describe("SSHRuntime.ensureReady repository checks", () => {
   let execBufferedSpy: ReturnType<typeof spyOn<typeof runtimeHelpers, "execBuffered">> | null =
     null;

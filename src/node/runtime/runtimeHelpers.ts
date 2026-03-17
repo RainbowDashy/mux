@@ -11,11 +11,10 @@ export interface WorkspaceMetadataForRuntime {
   runtimeConfig: RuntimeConfig;
   projectPath: string;
   name: string;
-}
-
-export interface WorkspaceExecutionPathMetadata extends WorkspaceMetadataForRuntime {
   namedWorkspacePath?: string;
 }
+
+export type WorkspaceExecutionPathMetadata = WorkspaceMetadataForRuntime;
 
 /**
  * Resolve the canonical execution root for a workspace.
@@ -56,15 +55,16 @@ export function resolveWorkspaceExecutionPath(
 }
 
 /**
- * Create a runtime from workspace metadata, ensuring workspaceName is always passed.
+ * Create a runtime from workspace metadata, ensuring workspace identity is always passed.
  *
- * Use this helper when creating a runtime from workspace metadata to ensure
- * DevcontainerRuntime.currentWorkspacePath is set, enabling host-path reads
- * (stat, readFile, etc.) before the container is ready.
+ * Use this helper when recreating a runtime for an existing workspace so runtimes that cache
+ * per-workspace state (for example DevcontainerRuntime host paths) start from the persisted
+ * workspace root instead of reconstructing it from canonical naming conventions.
  */
 export function createRuntimeForWorkspace(metadata: WorkspaceMetadataForRuntime): Runtime {
   return createRuntime(metadata.runtimeConfig, {
     projectPath: metadata.projectPath,
     workspaceName: metadata.name,
+    workspacePath: metadata.namedWorkspacePath,
   });
 }
