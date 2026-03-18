@@ -911,6 +911,8 @@ export class HistoryService {
         return Ok(undefined);
       }
 
+      const hadErrorMetadata = partial.metadata?.error != null;
+
       // Strip transient error metadata, but persist accumulated content.
       if (partial.metadata?.error) {
         const { error, errorType, ...cleanMetadata } = partial.metadata;
@@ -954,6 +956,12 @@ export class HistoryService {
         (!existingMessage || (partial.parts?.length ?? 0) > (existingMessage.parts?.length ?? 0)) &&
         hasCommitWorthyParts;
 
+      const shouldDeleteErroredPlaceholder =
+        hadErrorMetadata &&
+        !hasCommitWorthyParts &&
+        existingMessage?.id === partial.id &&
+        (existingMessage.parts?.length ?? 0) === 0;
+
       if (shouldCommit) {
         if (existingMessage) {
           const updateResult = await this.updateHistory(workspaceId, partial);
@@ -965,6 +973,14 @@ export class HistoryService {
           if (!appendResult.success) {
             return appendResult;
           }
+        }
+      } else if (shouldDeleteErroredPlaceholder) {
+        const deleteMessageResult = await this.deleteMessage(workspaceId, partial.id);
+        if (
+          !deleteMessageResult.success &&
+          !deleteMessageResult.error.includes("not found in history")
+        ) {
+          return deleteMessageResult;
         }
       }
 
@@ -1251,10 +1267,16 @@ export class HistoryService {
   }
 
   /**
-   * Truncate history after a specific message ID
-   * Removes the message with the given ID and all subsequent messages
+   * Truncate history after a specific message ID.
+   *
+   * By default this removes the target message and all subsequent messages. Callers can retain the
+   * target message when branching a new workspace from a specific reply.
    */
-  async truncateAfterMessage(workspaceId: string, messageId: string): Promise<Result<void>> {
+  async truncateAfterMessage(
+    workspaceId: string,
+    messageId: string,
+    options?: { keepTargetMessage?: boolean }
+  ): Promise<Result<void>> {
     return this.fileLocks.withLock(workspaceId, async () => {
       try {
         // Structural rewrite requires full file content
@@ -1265,8 +1287,13 @@ export class HistoryService {
           return Err(`Message with ID ${messageId} not found in history`);
         }
 
-        // Keep only messages before the target message
-        const truncatedMessages = messages.slice(0, messageIndex);
+        const keepTargetMessage = options?.keepTargetMessage === true;
+        // Response-level forks branch from the selected assistant turn, so they retain the target
+        // message while discarding anything that came after it.
+        const truncatedMessages = messages.slice(
+          0,
+          keepTargetMessage ? messageIndex + 1 : messageIndex
+        );
 
         // Rewrite the history file with truncated messages
         const historyPath = this.getChatHistoryPath(workspaceId);

@@ -28,6 +28,7 @@
 
 import { z } from "zod";
 import { AgentIdSchema, AgentSkillPackageSchema, SkillNameSchema } from "@/common/orpc/schemas";
+import { RUNTIME_MODE, type RuntimeMode } from "@/common/types/runtime";
 import {
   BASH_HARD_MAX_LINES,
   BASH_MAX_LINE_BYTES,
@@ -45,6 +46,7 @@ import { THINKING_LEVELS } from "@/common/types/thinking";
 
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
+import { TASK_VARIANT_PLACEHOLDER, TASK_GROUP_KIND_VALUES } from "@/common/utils/tools/taskGroups";
 
 // -----------------------------------------------------------------------------
 // ask_user_question (plan-mode interactive questions)
@@ -161,6 +163,69 @@ const TaskAgentIdSchema = z.preprocess(
   AgentIdSchema
 );
 
+const TaskToolBestOfCountSchema = z.number().int().min(1).max(20);
+
+const TaskToolVariantSchema = z.string().trim().min(1);
+
+const TaskToolVariantsSchema = z.array(TaskToolVariantSchema).min(1).max(20);
+
+function getTaskRuntimeVisibilityGuidance(runtimeMode: RuntimeMode | undefined): string {
+  switch (runtimeMode) {
+    case RUNTIME_MODE.LOCAL:
+      return (
+        "In local runtime, sub-agents share the same working directory as the parent, so they can see uncommitted changes. " +
+        "Be careful: they can also modify the same files concurrently."
+      );
+    case RUNTIME_MODE.WORKTREE:
+      return (
+        "In worktree runtime, sub-agents start from a forked workspace based on committed state. " +
+        "Uncommitted changes from the parent are not available. Commit any changes you want the sub-agent to consider before spawning a task."
+      );
+    case RUNTIME_MODE.DOCKER:
+      return (
+        "In Docker runtime, sub-agents start from a new workspace created from the repository's committed state. " +
+        "Uncommitted changes from the parent are not available. Commit any changes you want the sub-agent to consider before spawning a task."
+      );
+    case RUNTIME_MODE.DEVCONTAINER:
+      return (
+        "In devcontainer runtime, sub-agents start from a forked workspace based on committed state. " +
+        "Uncommitted changes from the parent are not available. Commit any changes you want the sub-agent to consider before spawning a task."
+      );
+    case RUNTIME_MODE.SSH:
+      return (
+        "In SSH runtime, sub-agents usually start from committed state. Some fallback fork paths may copy the working tree, but do not rely on that ambiguity. " +
+        "If the child must see your latest changes, commit them before spawning the task."
+      );
+    default:
+      return "Sub-agent visibility depends on runtime. If the child must see your latest work, commit it before spawning the task unless your runtime explicitly shares the working copy.";
+  }
+}
+
+export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): string {
+  return (
+    "Spawn a sub-agent task (child workspace). " +
+    "\n\nIMPORTANT: Whether a sub-agent can see uncommitted changes depends on the runtime. " +
+    `${getTaskRuntimeVisibilityGuidance(runtimeMode)} ` +
+    "\n\nProvide agentId (preferred) or subagent_type, prompt, title, run_in_background, and optional n or variants. " +
+    `Use n when you want several agents to try the same prompt independently. Use variants when you want several agents to run the same prompt template with a different ${TASK_VARIANT_PLACEHOLDER} substituted into each run. ` +
+    "Examples: solve GitHub issues 45, 32, and 69 with one shared issue-solving template; investigate a regression across commit windows like A..B and B..C with one shared investigation template; or split a review into frontend/backend/tests/docs lanes with one shared review template. " +
+    `For variants, keep the shared template in the prompt and put the per-lane difference into ${TASK_VARIANT_PLACEHOLDER}. ` +
+    "n and variants are mutually exclusive; omit both for a single task. Leave n and variants unset unless the developer explicitly asks for parallel sibling tasks, and prefer non-interfering sub-agents for grouped runs (for example read-only agents like explore). " +
+    "\n\nWhen the user explicitly asks for best-of-n work, the parent should begin with light preliminary analysis to extract shared context, constraints, or evaluation criteria that would otherwise be duplicated across children. " +
+    "Keep that pre-work lightweight: frame the task and provide useful starting points, but do not pre-solve the problem or over-constrain how the children reason about it. Then delegate the substantive analysis to the spawned sub-agents. " +
+    "Do not also do a full parallel analysis in the parent. After spawning a best-of batch, the next step should usually be task_await so you can synthesize from the child reports. " +
+    "\n\nWhen delegating, include a compact task brief (Task / Background / Scope / Starting points / Acceptance / Deliverables / Constraints). " +
+    "Avoid telling the sub-agent to read your plan file; child workspaces do not automatically have access to it. " +
+    "\n\nIf run_in_background is false, waits for the sub-agent to finish and returns the completed report. When grouped sibling tasks are requested via n or variants, the completed result includes one report per spawned task. " +
+    "If the foreground wait times out, returns queued/running task metadata with a note (the task continues running); use task_await to monitor progress. " +
+    "If run_in_background is true, returns immediately with queued/running task metadata; use task_await to wait for completion, task_list to rediscover active tasks, and task_terminate to stop it. " +
+    "Prefer run_in_background: false when spawning a single task — it is equivalent to spawning background + immediately awaiting, but saves a round-trip. " +
+    "Use run_in_background: true when launching multiple tasks in parallel so you can await them as a batch. " +
+    "Do not call task_await in the same parallel tool-call batch; wait for the returned task metadata first. " +
+    "Use the bash tool to run shell commands."
+  );
+}
+
 const TaskToolAgentArgsSchema = z
   .object({
     // Prefer agentId. subagent_type is a deprecated alias for backwards compatibility.
@@ -169,6 +234,12 @@ const TaskToolAgentArgsSchema = z
     prompt: z.string().min(1),
     title: z.string().min(1),
     run_in_background: z.boolean().default(false),
+    n: TaskToolBestOfCountSchema.nullish().describe(
+      "Optional best-of count. Use n when several agents should try the same prompt independently. Mutually exclusive with variants; omit both for a single task. Only use grouped runs for sub-agents without interfering side effects, such as read-only agents like explore."
+    ),
+    variants: TaskToolVariantsSchema.nullish().describe(
+      `Optional labels for sibling runs of the same prompt template. Use variants when the task should be repeated across labeled lanes such as issue numbers, commit windows, or frontend/backend/tests/docs review lanes. Mutually exclusive with n. When provided, Mux launches one sibling per label and substitutes ${TASK_VARIANT_PLACEHOLDER} in the prompt.`
+    ),
   })
   .strict()
   .superRefine((args, ctx) => {
@@ -194,31 +265,133 @@ const TaskToolAgentArgsSchema = z
       });
       return;
     }
+
+    if (args.n != null && args.variants != null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "n and variants are mutually exclusive",
+        path: ["variants"],
+      });
+    }
+
+    if (args.variants == null) {
+      return;
+    }
+
+    const uniqueVariants = new Set(args.variants);
+    if (uniqueVariants.size !== args.variants.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "variants must be unique",
+        path: ["variants"],
+      });
+    }
+
+    if (!args.prompt.includes(TASK_VARIANT_PLACEHOLDER)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `prompt must reference ${TASK_VARIANT_PLACEHOLDER} when variants are provided`,
+        path: ["prompt"],
+      });
+    }
   });
 
 export const TaskToolArgsSchema = TaskToolAgentArgsSchema;
 
-export const TaskToolQueuedResultSchema = z
+const TaskToolSpawnedTaskSchema = z
   .object({
-    status: z.enum(["queued", "running"]),
     taskId: z.string(),
-    note: z
-      .string()
-      .min(1)
-      .describe("Additional guidance for the caller (e.g., use task_await to monitor progress)."),
+    status: z.enum(["queued", "running", "completed", "interrupted"]),
+    groupKind: z.enum(TASK_GROUP_KIND_VALUES).optional(),
+    label: z.string().optional(),
   })
   .strict();
 
-export const TaskToolCompletedResultSchema = z
+const TaskToolCompletedReportSchema = z
   .object({
-    status: z.literal("completed"),
     taskId: z.string(),
     reportMarkdown: z.string(),
     title: z.string().optional(),
     agentId: z.string().optional(),
     agentType: z.string().optional(),
+    groupKind: z.enum(TASK_GROUP_KIND_VALUES).optional(),
+    label: z.string().optional(),
   })
   .strict();
+
+export const TaskToolQueuedResultSchema = z
+  .object({
+    status: z.enum(["queued", "running"]),
+    taskId: z.string().optional(),
+    taskIds: z.array(z.string()).min(1).optional(),
+    tasks: z.array(TaskToolSpawnedTaskSchema).min(1).optional(),
+    reports: z.array(TaskToolCompletedReportSchema).min(1).optional(),
+    note: z
+      .string()
+      .min(1)
+      .describe("Additional guidance for the caller (e.g., use task_await to monitor progress)."),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const hasSingleTaskId = typeof value.taskId === "string" && value.taskId.trim().length > 0;
+    const hasTaskIds = Array.isArray(value.taskIds) && value.taskIds.length > 0;
+    const hasTasks = Array.isArray(value.tasks) && value.tasks.length > 0;
+
+    if (!hasSingleTaskId && !hasTaskIds && !hasTasks) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Provide taskId for single-task results or taskIds/tasks for grouped task results",
+        path: ["taskId"],
+      });
+    }
+  });
+
+export const TaskToolCompletedResultSchema = z
+  .object({
+    status: z.literal("completed"),
+    taskId: z.string().optional(),
+    taskIds: z.array(z.string()).min(1).optional(),
+    reportMarkdown: z.string().optional(),
+    title: z.string().optional(),
+    agentId: z.string().optional(),
+    agentType: z.string().optional(),
+    reports: z.array(TaskToolCompletedReportSchema).min(1).optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const hasSingleTaskId = typeof value.taskId === "string" && value.taskId.trim().length > 0;
+    const hasSingleReport = typeof value.reportMarkdown === "string";
+    const hasReports = Array.isArray(value.reports) && value.reports.length > 0;
+
+    if (hasSingleTaskId !== hasSingleReport) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Single-task completed results must include both taskId and reportMarkdown",
+        path: hasSingleTaskId ? ["reportMarkdown"] : ["taskId"],
+      });
+    }
+
+    if (!hasSingleTaskId && !hasReports) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Provide taskId/reportMarkdown for single-task results or reports for grouped task results",
+        path: ["reports"],
+      });
+    }
+
+    const reports = value.reports;
+    if (hasReports && Array.isArray(reports)) {
+      const taskIds = value.taskIds;
+      if (Array.isArray(taskIds) && taskIds.length !== reports.length) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "taskIds length must match reports length when both are provided",
+          path: ["taskIds"],
+        });
+      }
+    }
+  });
 
 export const TaskToolResultSchema = z.discriminatedUnion("status", [
   TaskToolQueuedResultSchema,
@@ -788,6 +961,103 @@ export const TOOL_DEFINITIONS = {
         .strict()
     ),
   },
+  desktop_screenshot: {
+    description:
+      "Capture a screenshot of the desktop. " +
+      "Optionally accepts scaledWidth and scaledHeight hints for downstream consumers while still capturing at the desktop's actual resolution.",
+    schema: z
+      .object({
+        scaledWidth: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe("Optional scaled width hint in pixels for downstream consumers."),
+        scaledHeight: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe("Optional scaled height hint in pixels for downstream consumers."),
+      })
+      .strict(),
+  },
+  desktop_move_mouse: {
+    description: "Move the desktop mouse cursor to the provided screen coordinates.",
+    schema: z
+      .object({
+        x: z.number().int().describe("Target X coordinate in screen pixels."),
+        y: z.number().int().describe("Target Y coordinate in screen pixels."),
+      })
+      .strict(),
+  },
+  desktop_click: {
+    description:
+      "Click on the desktop at the provided screen coordinates. Defaults to the left mouse button when button is omitted.",
+    schema: z
+      .object({
+        x: z.number().int().describe("Target X coordinate in screen pixels."),
+        y: z.number().int().describe("Target Y coordinate in screen pixels."),
+        button: z
+          .enum(["left", "right"])
+          .nullish()
+          .describe("Optional mouse button to click. Defaults to left."),
+      })
+      .strict(),
+  },
+  desktop_double_click: {
+    description:
+      "Double-click on the desktop at the provided screen coordinates. Defaults to the left mouse button when button is omitted.",
+    schema: z
+      .object({
+        x: z.number().int().describe("Target X coordinate in screen pixels."),
+        y: z.number().int().describe("Target Y coordinate in screen pixels."),
+        button: z
+          .enum(["left"])
+          .nullish()
+          .describe("Optional mouse button to double-click. Defaults to left."),
+      })
+      .strict(),
+  },
+  desktop_drag: {
+    description: "Drag on the desktop from one screen position to another.",
+    schema: z
+      .object({
+        startX: z.number().int().describe("Starting X coordinate in screen pixels."),
+        startY: z.number().int().describe("Starting Y coordinate in screen pixels."),
+        endX: z.number().int().describe("Ending X coordinate in screen pixels."),
+        endY: z.number().int().describe("Ending Y coordinate in screen pixels."),
+      })
+      .strict(),
+  },
+  desktop_scroll: {
+    description: "Scroll on the desktop at the provided screen coordinates.",
+    schema: z
+      .object({
+        x: z.number().int().describe("Target X coordinate in screen pixels."),
+        y: z.number().int().describe("Target Y coordinate in screen pixels."),
+        deltaX: z.number().int().nullish().describe("Optional horizontal scroll delta in pixels."),
+        deltaY: z.number().int().describe("Vertical scroll delta in pixels."),
+      })
+      .strict(),
+  },
+  desktop_type: {
+    description: "Type text into the active desktop input target.",
+    schema: z
+      .object({
+        text: z.string().describe("Text to type into the active desktop target."),
+      })
+      .strict(),
+  },
+  desktop_key_press: {
+    description:
+      'Press a desktop key or key combination such as "ctrl+c", "Return", or "cmd+shift+p".',
+    schema: z
+      .object({
+        key: z.string().describe("Key or key combination to press on the desktop."),
+      })
+      .strict(),
+  },
   mux_agents_read: {
     description:
       "Read the AGENTS.md instructions file. In a project workspace, reads the project's AGENTS.md. " +
@@ -1069,20 +1339,7 @@ export const TOOL_DEFINITIONS = {
     schema: z.object({}),
   },
   task: {
-    description:
-      "Spawn a sub-agent task (child workspace). " +
-      "\n\nIMPORTANT: Subagents only see committed state. Uncommitted changes are not available. " +
-      "Commit any changes you want the sub-agent to consider before spawning a task. " +
-      "\n\nProvide agentId (preferred) or subagent_type, prompt, title, run_in_background. " +
-      "\n\nWhen delegating, include a compact task brief (Task / Background / Scope / Starting points / Acceptance / Deliverables / Constraints). " +
-      "Avoid telling the sub-agent to read your plan file; child workspaces do not automatically have access to it. " +
-      "\n\nIf run_in_background is false, waits for the sub-agent to finish and returns a completed reportMarkdown. " +
-      "If the foreground wait times out, returns a queued/running taskId with a note (the task continues running); use task_await to monitor progress. " +
-      "If run_in_background is true, returns immediately with a queued/running taskId; use task_await to wait for completion, task_list to rediscover active tasks, and task_terminate to stop it. " +
-      "Prefer run_in_background: false when spawning a single task — it is equivalent to spawning background + immediately awaiting, but saves a round-trip. " +
-      "Use run_in_background: true when launching multiple tasks in parallel so you can await them as a batch. " +
-      "Do not call task_await in the same parallel tool-call batch; wait for the returned taskId first. " +
-      "Use the bash tool to run shell commands.",
+    description: buildTaskToolDescription(undefined),
     schema: TaskToolArgsSchema,
   },
   task_apply_git_patch: {
@@ -1835,6 +2092,14 @@ export function getAvailableTools(
     "mux_config_write",
     "file_read",
     "attach_file",
+    "desktop_screenshot",
+    "desktop_move_mouse",
+    "desktop_click",
+    "desktop_double_click",
+    "desktop_drag",
+    "desktop_scroll",
+    "desktop_type",
+    "desktop_key_press",
     "agent_skill_read",
     "agent_skill_read_file",
     "file_edit_replace_string",

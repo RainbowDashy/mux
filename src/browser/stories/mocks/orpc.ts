@@ -1022,6 +1022,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     },
     general: {
       listDirectory: () => Promise.resolve({ entries: [], hasMore: false }),
+      restartApp: () => Promise.resolve({ supported: true as const }),
       ping: (input: string) => Promise.resolve(`Pong: ${input}`),
       tick: async function* () {
         // No ticks in the mock, but keep the subscription open.
@@ -1315,6 +1316,13 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         const project = projects.get(input.projectPath);
         if (project) {
           project.trusted = input.trusted;
+        }
+        return Promise.resolve();
+      },
+      setDisplayName: (input: { projectPath: string; displayName?: string | null }) => {
+        const project = projects.get(input.projectPath);
+        if (project) {
+          project.displayName = input.displayName ?? undefined;
         }
         return Promise.resolve();
       },

@@ -8,6 +8,7 @@ import React, { useState, useCallback, useEffect, useMemo, useRef } from "react"
 import {
   ArrowLeft,
   Check,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Circle,
@@ -24,9 +25,10 @@ import { KeycapGroup } from "@/browser/components/Keycap/Keycap";
 import { useAPI } from "@/browser/contexts/API";
 import { formatLineRangeCompact } from "@/browser/utils/review/lineRange";
 import {
+  findAdjacentFileHunkId,
   flattenFileTreeLeaves,
-  getAdjacentFilePath,
   getFileHunks,
+  sortHunksInFileOrder,
 } from "@/browser/utils/review/navigation";
 import {
   isDialogOpen,
@@ -36,6 +38,7 @@ import {
 } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { buildReadFileScript, processFileContents } from "@/browser/utils/fileExplorer";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import {
   parseReviewLineRange,
   type DiffHunk,
@@ -164,22 +167,6 @@ function normalizeFileLines(content: string): string[] {
     .split(/\r?\n/)
     .map((line) => (line.endsWith("\r") ? line.slice(0, Math.max(0, line.length - 1)) : line));
   return lines.filter((line, idx) => idx < lines.length - 1 || line !== "");
-}
-
-function sortHunksInFileOrder(hunks: DiffHunk[]): DiffHunk[] {
-  return [...hunks].sort((a, b) => {
-    const newStartDelta = a.newStart - b.newStart;
-    if (newStartDelta !== 0) {
-      return newStartDelta;
-    }
-
-    const oldStartDelta = a.oldStart - b.oldStart;
-    if (oldStartDelta !== 0) {
-      return oldStartDelta;
-    }
-
-    return a.id.localeCompare(b.id);
-  });
 }
 
 function buildOverlayFromFileContent(
@@ -399,9 +386,18 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
   // Flatten file tree into ordered file list
   const fileList = useMemo(() => flattenFileTreeLeaves(fileTree), [fileTree]);
+  const reviewedHunkCount = allHunks.filter((item) => props.isRead(item.id)).length;
+  const isReviewComplete =
+    allHunks.length > 0 && hunks.length === 0 && reviewedHunkCount === allHunks.length;
+  const reviewedHunkLabel = `${reviewedHunkCount} ${reviewedHunkCount === 1 ? "hunk" : "hunks"}`;
 
-  // Determine active file from selected hunk or first file
+  // When hide-read removes the last visible hunk, keep immersive review on an explicit
+  // completion state instead of falling back to the first file's empty diff view.
   const activeFilePath = useMemo(() => {
+    if (isReviewComplete) {
+      return null;
+    }
+
     if (selectedHunkId) {
       const selectedHunk =
         hunks.find((item) => item.id === selectedHunkId) ??
@@ -421,7 +417,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     }
 
     return null;
-  }, [selectedHunkId, hunks, allHunks, fileList]);
+  }, [selectedHunkId, hunks, allHunks, fileList, isReviewComplete]);
 
   const selectedHunkFromAll = useMemo(
     () => (selectedHunkId ? (allHunks.find((item) => item.id === selectedHunkId) ?? null) : null),
@@ -871,28 +867,26 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
   const navigateFile = useCallback(
     (direction: 1 | -1) => {
-      if (!activeFilePath || fileList.length <= 1) {
+      if (!activeFilePath) {
         return;
       }
 
       // Skip files with no currently visible hunks (e.g. filtered out by read/search filters).
       // This keeps file navigation moving forward instead of getting stuck on empty files.
-      let candidatePath = activeFilePath;
-      for (let step = 0; step < fileList.length - 1; step += 1) {
-        const nextPath = getAdjacentFilePath(fileList, candidatePath, direction);
-        if (!nextPath) {
-          return;
-        }
-
-        candidatePath = nextPath;
-        const fileHunks = sortHunksInFileOrder(getFileHunks(hunks, candidatePath));
-        if (fileHunks.length > 0) {
-          pendingJumpSelectAllHunkIdRef.current = null;
-          hunkJumpRef.current = true;
-          onSelectHunk(fileHunks[0].id);
-          return;
-        }
+      const targetHunkId = findAdjacentFileHunkId(
+        fileList,
+        activeFilePath,
+        hunks,
+        direction,
+        "first"
+      );
+      if (!targetHunkId) {
+        return;
       }
+
+      pendingJumpSelectAllHunkIdRef.current = null;
+      hunkJumpRef.current = true;
+      onSelectHunk(targetHunkId);
     },
     [activeFilePath, fileList, hunks, onSelectHunk]
   );
@@ -905,23 +899,51 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         ? currentFileHunks.findIndex((hunk) => hunk.id === selectedHunkId)
         : -1;
 
-      let nextIdx: number;
+      let targetHunkId: string | null;
       if (currentIdx === -1) {
-        nextIdx = direction === 1 ? 0 : currentFileHunks.length - 1;
+        targetHunkId =
+          currentFileHunks[direction === 1 ? 0 : currentFileHunks.length - 1]?.id ?? null;
       } else {
-        nextIdx = currentIdx + direction;
+        const nextIdx = currentIdx + direction;
         if (nextIdx < 0 || nextIdx >= currentFileHunks.length) {
-          setBoundaryToast("No more hunks in this file — use H / L to move between files");
-          return;
+          // Keep J/K feeling like one continuous hunk stream instead of forcing an
+          // extra file-navigation step at every file boundary.
+          targetHunkId = activeFilePath
+            ? findAdjacentFileHunkId(
+                fileList,
+                activeFilePath,
+                selectedHunkIsFilteredOut ? allHunks : hunks,
+                direction,
+                direction === 1 ? "first" : "last"
+              )
+            : null;
+          if (!targetHunkId) {
+            setBoundaryToast(
+              direction === 1
+                ? "Reached the last hunk in review"
+                : "Reached the first hunk in review"
+            );
+            return;
+          }
+        } else {
+          targetHunkId = currentFileHunks[nextIdx].id;
         }
       }
 
-      const targetHunkId = currentFileHunks[nextIdx].id;
       pendingJumpSelectAllHunkIdRef.current = targetHunkId;
       hunkJumpRef.current = true;
       onSelectHunk(targetHunkId);
     },
-    [currentFileHunks, selectedHunkId, onSelectHunk]
+    [
+      activeFilePath,
+      allHunks,
+      currentFileHunks,
+      fileList,
+      hunks,
+      onSelectHunk,
+      selectedHunkId,
+      selectedHunkIsFilteredOut,
+    ]
   );
 
   const navigateToReview = useCallback(
@@ -1552,32 +1574,40 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         <div className="flex min-w-0 flex-1 items-center gap-1 sm:flex-initial">
           <button
             onClick={() => navigateFile(-1)}
-            disabled={fileCount <= 1}
+            disabled={isReviewComplete || fileCount <= 1}
             className="text-muted hover:text-foreground disabled:text-dim flex shrink-0 cursor-pointer items-center border-none bg-transparent p-0 transition-colors disabled:cursor-default"
             aria-label="Previous file"
           >
             <ChevronLeft className="h-4 w-4" />
           </button>
           {/* Mobile: show filename only */}
-          <span
-            className="text-foreground min-w-0 flex-1 truncate font-mono text-xs sm:hidden"
-            title={activeFilePath ?? undefined}
+          <TooltipIfPresent
+            tooltip={isReviewComplete ? null : activeFilePath}
+            side="bottom"
+            align="start"
           >
-            {activeFilePath?.split("/").pop() ?? "No files"}
-          </span>
+            <span className="text-foreground min-w-0 flex-1 truncate font-mono text-xs sm:hidden">
+              {isReviewComplete
+                ? "Review complete"
+                : (activeFilePath?.split("/").pop() ?? "No files")}
+            </span>
+          </TooltipIfPresent>
           {/* Desktop: show full path */}
-          <span
-            className="text-foreground hidden max-w-[400px] truncate font-mono text-xs sm:block"
-            title={activeFilePath ?? undefined}
+          <TooltipIfPresent
+            tooltip={isReviewComplete ? null : activeFilePath}
+            side="bottom"
+            align="start"
           >
-            {activeFilePath ?? "No files"}
-          </span>
+            <span className="text-foreground hidden max-w-[400px] truncate font-mono text-xs sm:block">
+              {isReviewComplete ? "Review complete" : (activeFilePath ?? "No files")}
+            </span>
+          </TooltipIfPresent>
           <span className="text-dim hidden shrink-0 text-[10px] sm:inline">
-            {fileIndex >= 0 ? `${fileIndex + 1}/${fileCount}` : ""}
+            {!isReviewComplete && fileIndex >= 0 ? `${fileIndex + 1}/${fileCount}` : ""}
           </span>
           <button
             onClick={() => navigateFile(1)}
-            disabled={fileCount <= 1}
+            disabled={isReviewComplete || fileCount <= 1}
             className="text-muted hover:text-foreground disabled:text-dim flex shrink-0 cursor-pointer items-center border-none bg-transparent p-0 transition-colors disabled:cursor-default"
             aria-label="Next file"
           >
@@ -1606,38 +1636,46 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           </button>
         )}
         {/* Hunk selection summary — hidden on mobile, includes toggle on desktop */}
-        <div className="text-muted hidden items-center gap-1 text-[10px] sm:flex">
-          {selectedHunk && (
-            <button
-              type="button"
-              className={cn(
-                "text-muted hover:text-read flex cursor-pointer items-center border-none bg-transparent p-0 transition-colors duration-150",
-                props.isRead(selectedHunk.id) && "text-read"
-              )}
-              onClick={() => onToggleRead(selectedHunk.id)}
-              aria-label={
-                props.isRead(selectedHunk.id) ? "Mark hunk as unread" : "Mark hunk as read"
-              }
-            >
-              {props.isRead(selectedHunk.id) ? (
-                <Check aria-hidden="true" className="h-3 w-3" />
-              ) : (
-                <Circle aria-hidden="true" className="h-3 w-3" />
-              )}
-            </button>
-          )}
-          <span>
-            Hunk {currentHunkIdx >= 0 ? currentHunkIdx + 1 : "–"}/{currentFileHunks.length}
-          </span>
-          <span className="text-dim">·</span>
-          <span>Lines {selectedLineSummaryLabel}</span>
-          {selectedHunkLineCount > 0 && (
-            <>
-              <span className="text-dim">·</span>
-              <span>{selectedHunkLineCount} lines</span>
-            </>
-          )}
-        </div>
+        {(isReviewComplete || currentFileHunks.length > 0) && (
+          <div className="text-muted hidden items-center gap-1 text-[10px] sm:flex">
+            {isReviewComplete ? (
+              <span>All {reviewedHunkLabel} reviewed</span>
+            ) : (
+              <>
+                {selectedHunk && (
+                  <button
+                    type="button"
+                    className={cn(
+                      "text-muted hover:text-read flex cursor-pointer items-center border-none bg-transparent p-0 transition-colors duration-150",
+                      props.isRead(selectedHunk.id) && "text-read"
+                    )}
+                    onClick={() => onToggleRead(selectedHunk.id)}
+                    aria-label={
+                      props.isRead(selectedHunk.id) ? "Mark hunk as unread" : "Mark hunk as read"
+                    }
+                  >
+                    {props.isRead(selectedHunk.id) ? (
+                      <Check aria-hidden="true" className="h-3 w-3" />
+                    ) : (
+                      <Circle aria-hidden="true" className="h-3 w-3" />
+                    )}
+                  </button>
+                )}
+                <span>
+                  Hunk {currentHunkIdx >= 0 ? currentHunkIdx + 1 : "–"}/{currentFileHunks.length}
+                </span>
+                <span className="text-dim">·</span>
+                <span>Lines {selectedLineSummaryLabel}</span>
+                {selectedHunkLineCount > 0 && (
+                  <>
+                    <span className="text-dim">·</span>
+                    <span>{selectedHunkLineCount} lines</span>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Unified whole-file diff with hunk overlays + notes sidebar */}
@@ -1649,6 +1687,32 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           {props.isLoading && currentFileHunks.length === 0 ? (
             <div className="text-muted flex items-center justify-center py-12 text-sm">
               <span className="animate-pulse">Loading diff...</span>
+            </div>
+          ) : isReviewComplete ? (
+            <div className="flex min-h-full items-center justify-center px-6 py-12">
+              <div
+                data-testid="immersive-review-complete"
+                className="flex max-w-md flex-col items-center gap-4 text-center"
+              >
+                <div className="bg-accent/10 text-accent rounded-full p-3">
+                  <CheckCircle2 aria-hidden="true" className="h-8 w-8" />
+                </div>
+                <div className="space-y-2">
+                  <h2 className="text-foreground text-base font-medium">Review complete</h2>
+                  <p className="text-muted text-sm leading-relaxed">
+                    You have already reviewed all {reviewedHunkLabel} in this diff. Return to chat
+                    to keep going, or reopen reviewed hunks from the review panel if you want
+                    another pass.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={onExit}
+                  className="bg-accent hover:bg-accent/80 text-accent-foreground inline-flex items-center rounded-md px-3 py-1.5 text-xs font-medium transition-colors"
+                >
+                  Return to chat
+                </button>
+              </div>
             </div>
           ) : currentFileHunks.length === 0 ? (
             <div className="text-muted flex items-center justify-center py-12 text-sm">
@@ -1695,7 +1759,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           )}
         </div>
 
-        {overlayData && !isTouchExperience && !isActiveFileContentLoading && (
+        {!isReviewComplete && overlayData && !isTouchExperience && !isActiveFileContentLoading && (
           <ImmersiveMinimap
             content={overlayData.content}
             scrollContainerRef={scrollContainerRef}
@@ -1705,7 +1769,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           />
         )}
 
-        {!isTouchExperience && (
+        {!isReviewComplete && !isTouchExperience && (
           <aside className="border-border-light bg-dark flex w-[280px] min-w-[280px] flex-col border-l">
             <div className="border-border-light flex items-center justify-between border-b px-3 py-2">
               <h2
@@ -1768,12 +1832,15 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
                           <div className="flex items-center gap-1.5">
                             <ReviewTypeIcon className={cn("size-3 shrink-0", statusClasses.icon)} />
 
-                            <span
-                              className="text-muted min-w-0 flex-1 truncate font-mono text-[10px]"
-                              title={`${review.data.filePath}:L${formatLineRangeCompact(review.data.lineRange)}`}
+                            <TooltipIfPresent
+                              tooltip={`${review.data.filePath}:L${formatLineRangeCompact(review.data.lineRange)}`}
+                              side="top"
+                              align="start"
                             >
-                              {`${getFileBaseName(review.data.filePath)}:L${formatLineRangeCompact(review.data.lineRange)}`}
-                            </span>
+                              <span className="text-muted min-w-0 flex-1 truncate font-mono text-[10px]">
+                                {`${getFileBaseName(review.data.filePath)}:L${formatLineRangeCompact(review.data.lineRange)}`}
+                              </span>
+                            </TooltipIfPresent>
 
                             <span
                               className={cn(
@@ -1783,32 +1850,42 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
                             >
                               {review.status}
                             </span>
-
-                            {props.reviewActions?.onDelete && (
-                              <button
-                                type="button"
-                                className="text-muted hover:text-error ml-0.5 hidden cursor-pointer items-center rounded p-0.5 transition-colors group-hover/review-item:inline-flex"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  props.reviewActions?.onDelete?.(review.id);
-                                }}
-                                aria-label="Delete review note"
-                              >
-                                <Trash2 className="size-3" />
-                              </button>
-                            )}
                           </div>
 
-                          <p
-                            className="text-foreground mt-1 overflow-hidden text-[11px] leading-[1.4] break-words whitespace-pre-wrap"
-                            style={{
-                              display: "-webkit-box",
-                              WebkitBoxOrient: "vertical",
-                              WebkitLineClamp: 2,
-                            }}
-                          >
-                            {review.data.userNote || "(No note text)"}
-                          </p>
+                          <div className="mt-1 flex flex-col">
+                            <p
+                              className="text-foreground overflow-hidden text-[11px] leading-[1.4] break-words whitespace-pre-wrap"
+                              style={{
+                                display: "-webkit-box",
+                                WebkitBoxOrient: "vertical",
+                                WebkitLineClamp: 2,
+                              }}
+                            >
+                              {review.data.userNote || "(No note text)"}
+                            </p>
+
+                            {/* Keep preview actions in a reserved footer so hover reveals do not shift note content. */}
+                            {props.reviewActions?.onDelete && (
+                              <div className="mt-1 flex min-h-4 items-center justify-end">
+                                <button
+                                  type="button"
+                                  className="text-muted hover:text-error invisible cursor-pointer rounded p-0.5 opacity-0 transition-colors transition-opacity group-focus-within/review-item:visible group-focus-within/review-item:opacity-100 group-hover/review-item:visible group-hover/review-item:opacity-100"
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter" || event.key === " ") {
+                                      stopKeyboardPropagation(event);
+                                    }
+                                  }}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    props.reviewActions?.onDelete?.(review.id);
+                                  }}
+                                  aria-label="Delete review note"
+                                >
+                                  <Trash2 className="size-3" />
+                                </button>
+                              </div>
+                            )}
+                          </div>
                         </div>
                       </div>
                     );

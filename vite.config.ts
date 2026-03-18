@@ -5,6 +5,7 @@ import svgr from "vite-plugin-svgr";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 import { fileURLToPath } from "url";
+import { novncCompatPlugin } from "./src/vite/novncCompatPlugin";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const disableMermaid = process.env.VITE_DISABLE_MERMAID === "1";
@@ -47,6 +48,15 @@ const devServerAllowedHosts = (() => {
 })();
 
 const previewPort = Number(process.env.MUX_VITE_PREVIEW_PORT ?? "4173");
+
+const enableTutorialsInSandboxDefine = (() => {
+  const raw = process.env.MUX_ENABLE_TUTORIALS_IN_SANDBOX;
+  if (raw == null) {
+    return "null";
+  }
+
+  return JSON.stringify(raw === "1");
+})();
 
 function formatHostForUrl(host: string): string {
   const trimmed = host.trim();
@@ -98,6 +108,7 @@ const basePlugins = [
     },
   }),
   tailwindcss(),
+  novncCompatPlugin(),
 ];
 
 export default defineConfig(({ mode }) => {
@@ -110,13 +121,13 @@ export default defineConfig(({ mode }) => {
   }
 
   return {
-    // This prevents mermaid initialization errors in production while allowing dev to work
     plugins: mode === "development" ? [...basePlugins, topLevelAwait()] : basePlugins,
     resolve: {
       alias: aliasMap,
     },
     define: {
       "globalThis.__MUX_MD_URL_OVERRIDE__": JSON.stringify(process.env.MUX_MD_URL_OVERRIDE ?? ""),
+      "globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__": enableTutorialsInSandboxDefine,
       ...(isProfiling ? { __PROFILE__: "true" } : {}),
     },
     base: "./",
@@ -224,9 +235,9 @@ export default defineConfig(({ mode }) => {
       allowedHosts: ["localhost", "127.0.0.1"],
     },
     optimizeDeps: {
-      esbuildOptions: {
-        target: "esnext",
-      },
+      // noVNC ships Babel-style CJS plus top-level await in lib/, which breaks esbuild
+      // pre-bundling. Keep it excluded so novncCompatPlugin can rewrite it on demand.
+      exclude: ["@novnc/novnc"],
 
       // Limit dependency pre-bundling scans to the renderer entrypoints.
       // Scanning all of src/ includes backend-only code (src/node, src/cli), which can

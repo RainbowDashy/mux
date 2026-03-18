@@ -46,6 +46,7 @@ import {
   resolveSshAgentForwarding,
 } from "./credentialForwarding";
 import { streamToString, shescape } from "./streamUtils";
+import { syncRuntimeGitSubmodules } from "./submoduleSync";
 
 /** Hardcoded source directory inside container */
 const CONTAINER_SRC_DIR = "/src";
@@ -57,6 +58,15 @@ interface DockerCommandResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+}
+
+/**
+ * Sanitize container-provided uid/gid before embedding in host-side shell commands.
+ * Container images can override `id`; only decimal numeric IDs are valid for chown.
+ */
+function sanitizeContainerUserId(rawValue: string): string {
+  const trimmedValue = rawValue.trim();
+  return /^\d+$/.test(trimmedValue) ? trimmedValue : "0";
 }
 
 /** Result of checking if a container already exists and is valid for reuse */
@@ -681,8 +691,8 @@ export class DockerRuntime extends RemoteRuntime {
       runDockerCommand(`docker exec ${containerName} id -g`, 5000),
       runDockerCommand(`docker exec ${containerName} sh -c 'echo $HOME'`, 5000),
     ]);
-    this.containerUid = uidResult.stdout.trim() || "0";
-    this.containerGid = gidResult.stdout.trim() || "0";
+    this.containerUid = sanitizeContainerUserId(uidResult.stdout);
+    this.containerGid = sanitizeContainerUserId(gidResult.stdout);
     this.containerHome = homeResult.stdout.trim() || "/root";
 
     // Create /src directory and /var/mux/plans in container
@@ -744,6 +754,53 @@ export class DockerRuntime extends RemoteRuntime {
       throw new Error(`Failed to checkout branch: ${stderr || stdout}`);
     }
     initLogger.logStep("Branch checked out successfully");
+
+    await this.materializeCheckedOutWorkspace({
+      containerName,
+      workspacePath,
+      initLogger,
+      abortSignal,
+      env,
+      trusted: params.trusted,
+    });
+  }
+
+  private async materializeCheckedOutWorkspace(args: {
+    containerName: string;
+    workspacePath: string;
+    initLogger: InitLogger;
+    abortSignal?: AbortSignal;
+    env?: Record<string, string>;
+    trusted?: boolean;
+  }): Promise<void> {
+    try {
+      // Container provisioning owns checkout completeness so initWorkspace can focus on
+      // running repo-controlled hooks against an already-materialized source tree.
+      await syncRuntimeGitSubmodules({
+        runtime: this,
+        workspacePath: args.workspacePath,
+        initLogger: args.initLogger,
+        abortSignal: args.abortSignal,
+        env: args.env,
+        trusted: args.trusted,
+      });
+    } catch (error) {
+      try {
+        await this.removeProvisioningContainer(args.containerName);
+      } catch (cleanupError) {
+        throw new Error(
+          `${getErrorMessage(error)} (cleanup failed: ${getErrorMessage(cleanupError)})`
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async removeProvisioningContainer(containerName: string): Promise<void> {
+    const removeResult = await runDockerCommand(`docker rm -f ${containerName}`, 10000);
+    if (removeResult.exitCode !== 0) {
+      throw new Error(removeResult.stderr || removeResult.stdout || "docker rm failed");
+    }
   }
 
   private async syncProjectToContainer(
@@ -1015,8 +1072,8 @@ export class DockerRuntime extends RemoteRuntime {
         runDockerCommand(`docker exec ${destContainerName} id -g`, 5000),
         runDockerCommand(`docker exec ${destContainerName} sh -c 'echo $HOME'`, 5000),
       ]);
-      const destUid = uidResult.stdout.trim() || "0";
-      const destGid = gidResult.stdout.trim() || "0";
+      const destUid = sanitizeContainerUserId(uidResult.stdout);
+      const destGid = sanitizeContainerUserId(gidResult.stdout);
       const destHome = homeResult.stdout.trim() || "/root";
 
       // Create /src and /var/mux/plans as root, then chown to container user
@@ -1209,8 +1266,8 @@ export class DockerRuntime extends RemoteRuntime {
         runDockerCommand(`docker exec ${this.containerName} id -g`, 5000),
         runDockerCommand(`docker exec ${this.containerName} sh -c 'echo $HOME'`, 5000),
       ]);
-      this.containerUid = uidResult.stdout.trim() || "0";
-      this.containerGid = gidResult.stdout.trim() || "0";
+      this.containerUid = sanitizeContainerUserId(uidResult.stdout);
+      this.containerGid = sanitizeContainerUserId(gidResult.stdout);
       this.containerHome = homeResult.stdout.trim() || "/root";
     }
 

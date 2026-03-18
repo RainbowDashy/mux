@@ -1,4 +1,10 @@
-import { getAvailableTools, TaskToolArgsSchema, TOOL_DEFINITIONS } from "./toolDefinitions";
+import { RUNTIME_MODE } from "@/common/types/runtime";
+import {
+  buildTaskToolDescription,
+  getAvailableTools,
+  TaskToolArgsSchema,
+  TOOL_DEFINITIONS,
+} from "./toolDefinitions";
 
 describe("TOOL_DEFINITIONS", () => {
   it("accepts custom subagent_type IDs (deprecated alias)", () => {
@@ -13,6 +19,97 @@ describe("TOOL_DEFINITIONS", () => {
     if (parsed.success) {
       expect(parsed.data.subagent_type).toBe("potato");
     }
+  });
+
+  it("leaves n unset for task tool calls when omitted", () => {
+    const parsed = TaskToolArgsSchema.safeParse({
+      subagent_type: "explore",
+      prompt: "do the thing",
+      title: "Test",
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.n).toBeUndefined();
+      expect(parsed.data.variants).toBeUndefined();
+    }
+  });
+
+  it("accepts task tool best-of counts between 1 and 20", () => {
+    expect(
+      TaskToolArgsSchema.safeParse({
+        subagent_type: "explore",
+        prompt: "do the thing",
+        title: "Test",
+        n: 20,
+      }).success
+    ).toBe(true);
+
+    expect(
+      TaskToolArgsSchema.safeParse({
+        subagent_type: "explore",
+        prompt: "do the thing",
+        title: "Test",
+        n: 0,
+      }).success
+    ).toBe(false);
+
+    expect(
+      TaskToolArgsSchema.safeParse({
+        subagent_type: "explore",
+        prompt: "do the thing",
+        title: "Test",
+        n: 21,
+      }).success
+    ).toBe(false);
+  });
+
+  it("accepts variants when the prompt references ${variant}", () => {
+    const parsed = TaskToolArgsSchema.safeParse({
+      subagent_type: "explore",
+      prompt: "Review ${variant} for regressions",
+      title: "Split review",
+      variants: ["frontend", "backend"],
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.variants).toEqual(["frontend", "backend"]);
+    }
+  });
+
+  it("rejects variants when the prompt does not reference ${variant}", () => {
+    expect(
+      TaskToolArgsSchema.safeParse({
+        subagent_type: "explore",
+        prompt: "Review the codebase for regressions",
+        title: "Split review",
+        variants: ["frontend", "backend"],
+      }).success
+    ).toBe(false);
+  });
+
+  it("rejects variants when n is also provided", () => {
+    expect(
+      TaskToolArgsSchema.safeParse({
+        subagent_type: "explore",
+        prompt: "Review ${variant} for regressions",
+        title: "Split review",
+        n: 2,
+        variants: ["frontend", "backend"],
+      }).success
+    ).toBe(false);
+  });
+
+  it("rejects duplicate variants after trimming", () => {
+    expect(
+      TaskToolArgsSchema.safeParse({
+        subagent_type: "explore",
+        prompt: "Review ${variant} for regressions",
+        title: "Split review",
+        variants: ["frontend", " frontend "],
+      }).success
+    ).toBe(false);
   });
 
   it("accepts bash tool calls using command (alias for script)", () => {
@@ -150,9 +247,32 @@ describe("TOOL_DEFINITIONS", () => {
     );
   });
 
-  it("encourages compact task briefs when spawning sub-agents", () => {
+  it("encourages compact task briefs and best-of delegation discipline", () => {
     expect(TOOL_DEFINITIONS.task.description).toContain("compact task brief");
     expect(TOOL_DEFINITIONS.task.description).toContain("plan file");
+    expect(TOOL_DEFINITIONS.task.description).toContain(
+      "Do not also do a full parallel analysis in the parent"
+    );
+    expect(TOOL_DEFINITIONS.task.description).toContain(
+      "the next step should usually be task_await"
+    );
+  });
+
+  it("keeps static task guidance runtime-agnostic", () => {
+    expect(TOOL_DEFINITIONS.task.description).toContain(
+      "Whether a sub-agent can see uncommitted changes depends on the runtime"
+    );
+    expect(TOOL_DEFINITIONS.task.description).not.toContain("Subagents only see committed state");
+  });
+
+  it("builds runtime-specific task guidance for local and worktree runtimes", () => {
+    const localDescription = buildTaskToolDescription(RUNTIME_MODE.LOCAL);
+    expect(localDescription).toContain("share the same working directory as the parent");
+    expect(localDescription).toContain("can see uncommitted changes");
+
+    const worktreeDescription = buildTaskToolDescription(RUNTIME_MODE.WORKTREE);
+    expect(worktreeDescription).toContain("forked workspace based on committed state");
+    expect(worktreeDescription).toContain("Uncommitted changes from the parent are not available");
   });
 
   it("accepts ask_user_question headers longer than 12 characters", () => {

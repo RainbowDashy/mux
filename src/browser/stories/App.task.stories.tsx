@@ -270,6 +270,197 @@ Found **47 test files** across the project:
 };
 
 /**
+ * Best-of-n task card: coalesces duplicate prompts into one grouped chat card.
+ */
+export const BestOfTaskGroup: Story = {
+  render: () => {
+    const client = createMockORPCClient();
+
+    return (
+      <TaskStoryFrame client={client}>
+        <TaskToolCall
+          workspaceId="ws-best-of"
+          args={{
+            subagent_type: "explore",
+            prompt: "Compare three implementation strategies for the sidebar grouping UI.",
+            title: "Compare implementation strategies",
+            run_in_background: false,
+            n: 3,
+          }}
+          result={{
+            status: "completed",
+            taskIds: ["task-best-of-1", "task-best-of-2", "task-best-of-3"],
+            reports: [
+              {
+                taskId: "task-best-of-1",
+                title: "Option 1",
+                agentId: "explore",
+                agentType: "explore",
+                reportMarkdown: "Focus on **shared helper utilities** for tree coalescing.",
+              },
+              {
+                taskId: "task-best-of-2",
+                title: "Option 2",
+                agentId: "explore",
+                agentType: "explore",
+                reportMarkdown: "Prefer a **synthetic group row** with expandable candidates.",
+              },
+              {
+                taskId: "task-best-of-3",
+                title: "Option 3",
+                agentId: "explore",
+                agentType: "explore",
+                reportMarkdown: "Keep the grouping logic **local to ProjectSidebar**.",
+              },
+            ],
+          }}
+          status="completed"
+        />
+      </TaskStoryFrame>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toolHeader = await canvas.findByText("task", { selector: "span" });
+    await userEvent.click(toolHeader);
+
+    await waitFor(() => {
+      const text = canvasElement.textContent ?? "";
+      if (!text.includes("Best of 3")) {
+        throw new Error("Expected grouped best-of task header to be rendered");
+      }
+      if (!text.includes("candidate 1") || !text.includes("candidate 3")) {
+        throw new Error("Expected grouped candidates to be rendered");
+      }
+    });
+  },
+};
+
+/**
+ * Variants task card: the same review prompt template is reused across frontend/backend/tests lanes by substituting `${variant}`.
+ */
+export const VariantTaskGroup: Story = {
+  render: () => {
+    const client = createMockORPCClient();
+
+    return (
+      <TaskStoryFrame client={client}>
+        <TaskToolCall
+          workspaceId="ws-variants"
+          args={{
+            subagent_type: "explore",
+            prompt: "Review ${variant} changes for regressions",
+            title: "Review by lane",
+            run_in_background: false,
+            variants: ["frontend", "backend", "tests"],
+          }}
+          result={{
+            status: "completed",
+            taskIds: ["task-variant-1", "task-variant-2", "task-variant-3"],
+            reports: [
+              {
+                taskId: "task-variant-1",
+                title: "Review by lane",
+                agentId: "explore",
+                agentType: "explore",
+                groupKind: "variants",
+                label: "frontend",
+                reportMarkdown: "Found one **frontend** regression risk.",
+              },
+              {
+                taskId: "task-variant-2",
+                title: "Review by lane",
+                agentId: "explore",
+                agentType: "explore",
+                groupKind: "variants",
+                label: "backend",
+                reportMarkdown: "Found two **backend** cleanup opportunities.",
+              },
+              {
+                taskId: "task-variant-3",
+                title: "Review by lane",
+                agentId: "explore",
+                agentType: "explore",
+                groupKind: "variants",
+                label: "tests",
+                reportMarkdown: "Found one **test coverage** gap.",
+              },
+            ],
+          }}
+          status="completed"
+        />
+      </TaskStoryFrame>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toolHeader = await canvas.findByText("task", { selector: "span" });
+    await userEvent.click(toolHeader);
+
+    await waitFor(() => {
+      const text = canvasElement.textContent ?? "";
+      if (!text.includes("Variants · Review by lane")) {
+        throw new Error("Expected grouped variants task header to be rendered");
+      }
+      if (!text.includes("frontend") || !text.includes("tests")) {
+        throw new Error("Expected variant labels to be rendered");
+      }
+    });
+  },
+};
+
+/**
+ * Variants task card during execution: the same regression-investigation template is reused across commit windows, so labels come from the parent args before reports arrive.
+ */
+export const VariantTaskGroupWhileRunning: Story = {
+  render: () => {
+    const client = createMockORPCClient();
+
+    return (
+      <TaskStoryFrame client={client}>
+        <TaskToolCall
+          workspaceId="ws-variants-running"
+          args={{
+            subagent_type: "explore",
+            prompt: "Investigate regressions introduced in ${variant}",
+            title: "Split regression search",
+            run_in_background: true,
+            variants: ["9f1e..a3c2", "a3c2..b4d5", "b4d5..c6e7"],
+          }}
+          result={{
+            status: "running",
+            taskIds: ["task-variant-live-1", "task-variant-live-2", "task-variant-live-3"],
+            tasks: [
+              { taskId: "task-variant-live-1", status: "running" },
+              { taskId: "task-variant-live-2", status: "queued" },
+              { taskId: "task-variant-live-3", status: "queued" },
+            ],
+            note: "Use task_await to monitor progress.",
+          }}
+          status="completed"
+        />
+      </TaskStoryFrame>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toolHeader = await canvas.findByText("task", { selector: "span" });
+    await userEvent.click(toolHeader);
+
+    await waitFor(() => {
+      const text = canvasElement.textContent ?? "";
+      if (
+        !text.includes("9f1e..a3c2") ||
+        !text.includes("a3c2..b4d5") ||
+        !text.includes("b4d5..c6e7")
+      ) {
+        throw new Error("Expected live variant labels to be rendered from task args");
+      }
+    });
+  },
+};
+
+/**
  * Completed task with transcript viewer support.
  */
 export const TaskTranscriptViewer: Story = {

@@ -16,7 +16,11 @@ import { AgentSession } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
+import type {
+  ExtensionMetadataService,
+  ExtensionMetadataStreamingUpdate,
+} from "@/node/services/ExtensionMetadataService";
+import { coerceAgentStatus } from "@/node/utils/extensionMetadata";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
@@ -101,8 +105,15 @@ import {
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import type { StreamEndEvent, StreamAbortEvent, ToolCallEndEvent } from "@/common/types/stream";
+import type {
+  StreamStartEvent,
+  StreamEndEvent,
+  StreamAbortEvent,
+  ToolCallEndEvent,
+} from "@/common/types/stream";
 import type { TerminalService } from "@/node/services/terminalService";
+import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { BrowserSessionService } from "@/node/services/browserSessionService";
 import type { WorkspaceAISettingsSchema } from "@/common/orpc/schemas";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
@@ -316,29 +327,37 @@ function buildWorkspaceTitleConversationContext(
 }
 
 /**
+ * Find the highest sequential number among items that match `prefix<digits>trailingSuffix`.
+ * Returns 0 when no items match.
+ */
+function findMaxSequentialNumber(items: string[], prefix: string, trailingSuffix = ""): number {
+  let max = 0;
+  for (const item of items) {
+    if (!item.startsWith(prefix)) continue;
+    if (trailingSuffix && !item.endsWith(trailingSuffix)) continue;
+
+    const numberStr = trailingSuffix
+      ? item.slice(prefix.length, -trailingSuffix.length)
+      : item.slice(prefix.length);
+    if (!/^\d+$/.test(numberStr)) continue;
+
+    const n = Number(numberStr);
+    if (n > max) max = n;
+  }
+  return max;
+}
+
+/**
  * Generate a unique fork branch name from the parent workspace name.
- * Scans existing workspace names for the `{parentName}-fork-N` pattern
- * and picks N+1, guaranteeing a valid git-safe branch name.
+ * Scans existing workspace names for the parent fork family pattern and picks N+1,
+ * guaranteeing a valid git-safe branch name.
  */
 export function generateForkBranchName(parentName: string, existingNames: string[]): string {
-  const prefix = `${parentName}-fork-`;
-  let max = 0;
-  for (const name of existingNames) {
-    if (!name.startsWith(prefix)) {
-      continue;
-    }
-
-    const suffix = name.slice(prefix.length);
-    if (!/^\d+$/.test(suffix)) {
-      continue;
-    }
-
-    const n = Number(suffix);
-    if (n > max) {
-      max = n;
-    }
-  }
-  return `${prefix}${max + 1}`;
+  // Forking an existing fork should stay in the same numbered family.
+  // e.g. `feature-fork-2` -> `feature-fork-3`, not `feature-fork-2-fork-1`.
+  const base = parentName.replace(/-fork-\d+$/, "");
+  const prefix = `${base}-fork-`;
+  return `${prefix}${findMaxSequentialNumber(existingNames, prefix) + 1}`;
 }
 
 /**
@@ -349,26 +368,9 @@ export function generateForkTitle(parentTitle: string, existingTitles: string[])
   // Strip any existing " (N)" suffix from the parent title to get the base
   const base = parentTitle.replace(/ \(\d+\)$/, "");
   const prefix = `${base} (`;
-
-  let max = 0;
-  for (const title of existingTitles) {
-    if (!title.startsWith(prefix) || !title.endsWith(")")) {
-      continue;
-    }
-
-    const suffix = title.slice(prefix.length, -1);
-    if (!/^\d+$/.test(suffix)) {
-      continue;
-    }
-
-    const n = Number(suffix);
-    if (n > max) {
-      max = n;
-    }
-  }
   // If parent title itself exists in the list (without suffix), start at (1)
   // Otherwise continue from the highest found suffix
-  return `${base} (${max + 1})`;
+  return `${base} (${findMaxSequentialNumber(existingTitles, prefix, ")") + 1})`;
 }
 
 function isErrnoWithCode(error: unknown, code: string): boolean {
@@ -383,6 +385,22 @@ async function copyIfExists(sourcePath: string, destinationPath: string): Promis
       throw error;
     }
   }
+}
+
+async function resetForkedSessionUsage(
+  sessionUsageService: SessionUsageService | undefined,
+  workspaceId: string,
+  sessionDir: string
+): Promise<void> {
+  if (sessionUsageService) {
+    await sessionUsageService.resetSessionUsage(workspaceId);
+    return;
+  }
+
+  await fsPromises.writeFile(
+    path.join(sessionDir, "session-usage.json"),
+    JSON.stringify({ byModel: {}, version: 1 }, null, 2)
+  );
 }
 
 function isPathInsideDir(dirPath: string, filePath: string): boolean {
@@ -1089,8 +1107,11 @@ export class WorkspaceService extends EventEmitter {
   private readonly telemetryService?: TelemetryService;
   private readonly experimentsService?: ExperimentsService;
   private mcpServerManager?: MCPServerManager;
-  // Optional terminal service for cleanup on workspace removal
+  // Optional services for workspace cleanup during archive/remove lifecycle operations.
   private terminalService?: TerminalService;
+  private desktopSessionManager?: DesktopSessionManager;
+  // Optional browser session service for cleanup on workspace archive/removal.
+  private browserSessionService?: BrowserSessionService;
   private readonly sessionTimingService?: SessionTimingService;
   private workspaceLifecycleHooks?: WorkspaceLifecycleHooks;
   private taskService?: TaskService;
@@ -1108,6 +1129,27 @@ export class WorkspaceService extends EventEmitter {
    */
   setTerminalService(terminalService: TerminalService): void {
     this.terminalService = terminalService;
+  }
+
+  setDesktopSessionManager(manager: DesktopSessionManager): void {
+    this.desktopSessionManager = manager;
+  }
+
+  private async closeDesktopSessionBestEffort(
+    workspaceId: string,
+    reason: "archive" | "remove"
+  ): Promise<void> {
+    try {
+      await this.desktopSessionManager?.close(workspaceId);
+    } catch (error) {
+      log.debug(
+        `Failed to close desktop session during ${reason} for workspace ${workspaceId}: ${getErrorMessage(error)}`
+      );
+    }
+  }
+
+  setBrowserSessionService(browserSessionService: BrowserSessionService): void {
+    this.browserSessionService = browserSessionService;
   }
 
   setWorkspaceLifecycleHooks(hooks: WorkspaceLifecycleHooks): void {
@@ -1143,10 +1185,8 @@ export class WorkspaceService extends EventEmitter {
     const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
     const isWorkspaceEvent = (v: unknown): v is { workspaceId: string } =>
       isObj(v) && "workspaceId" in v && typeof v.workspaceId === "string";
-    const isStreamStartEvent = (
-      v: unknown
-    ): v is { workspaceId: string; model: string; agentId?: string } =>
-      isWorkspaceEvent(v) && "model" in v && typeof v.model === "string";
+    const isStreamStartEvent = (v: unknown): v is StreamStartEvent =>
+      isWorkspaceEvent(v) && "model" in v && typeof (v as { model: unknown }).model === "string";
     const isStreamEndEvent = (v: unknown): v is StreamEndEvent =>
       isWorkspaceEvent(v) &&
       (!("metadata" in (v as Record<string, unknown>)) || isObj((v as StreamEndEvent).metadata));
@@ -1158,37 +1198,18 @@ export class WorkspaceService extends EventEmitter {
       "toolName" in v &&
       typeof (v as { toolName: unknown }).toolName === "string" &&
       "result" in v;
-    const extractStatusSetResult = (result: unknown): WorkspaceAgentStatus | null => {
-      if (!isObj(result)) {
-        return null;
-      }
-
-      if (
-        result.success !== true ||
-        typeof result.emoji !== "string" ||
-        typeof result.message !== "string"
-      ) {
-        return null;
-      }
-
-      if (result.url !== undefined && typeof result.url !== "string") {
-        return null;
-      }
-
-      return {
-        emoji: result.emoji,
-        message: result.message,
-        ...(typeof result.url === "string" ? { url: result.url } : {}),
-      };
-    };
+    const extractStatusSetResult = (result: unknown): WorkspaceAgentStatus | null =>
+      isObj(result) && result.success === true ? coerceAgentStatus(result) : null;
     // Update streaming status and recency on stream start
     this.aiService.on("stream-start", (data: unknown) => {
       if (isStreamStartEvent(data)) {
-        this.streamingGenerations.set(
-          data.workspaceId,
-          (this.streamingGenerations.get(data.workspaceId) ?? 0) + 1
-        );
-        void this.updateStreamingStatus(data.workspaceId, true, data.model, data.agentId);
+        const generation = (this.streamingGenerations.get(data.workspaceId) ?? 0) + 1;
+        this.streamingGenerations.set(data.workspaceId, generation);
+        void this.updateStreamingStatus(data.workspaceId, true, {
+          model: data.model,
+          thinkingLevel: data.thinkingLevel,
+          generation,
+        });
       }
     });
 
@@ -1246,57 +1267,40 @@ export class WorkspaceService extends EventEmitter {
     this.emit("activity", { workspaceId, activity: snapshot });
   }
 
-  private async updateRecencyTimestamp(workspaceId: string, timestamp?: number): Promise<void> {
+  private async emitWorkspaceActivityUpdate(
+    workspaceId: string,
+    description: string,
+    update: () => Promise<WorkspaceActivitySnapshot>
+  ): Promise<void> {
     try {
-      const snapshot = await this.extensionMetadata.updateRecency(
-        workspaceId,
-        timestamp ?? Date.now()
-      );
-      this.emitWorkspaceActivity(workspaceId, snapshot);
+      this.emitWorkspaceActivity(workspaceId, await update());
     } catch (error) {
-      log.error("Failed to update workspace recency", { workspaceId, error });
+      log.error(`Failed to ${description}`, { workspaceId, error });
     }
+  }
+
+  private async updateRecencyTimestamp(workspaceId: string, timestamp?: number): Promise<void> {
+    await this.emitWorkspaceActivityUpdate(workspaceId, "update workspace recency", () =>
+      this.extensionMetadata.updateRecency(workspaceId, timestamp ?? Date.now())
+    );
   }
 
   public async updateAgentStatus(
     workspaceId: string,
     agentStatus: WorkspaceAgentStatus | null
   ): Promise<void> {
-    try {
-      const snapshot = await this.extensionMetadata.setAgentStatus(workspaceId, agentStatus);
-      this.emitWorkspaceActivity(workspaceId, snapshot);
-    } catch (error) {
-      log.error("Failed to update workspace agent status", { workspaceId, error });
-    }
+    await this.emitWorkspaceActivityUpdate(workspaceId, "update workspace agent status", () =>
+      this.extensionMetadata.setAgentStatus(workspaceId, agentStatus)
+    );
   }
 
   private async updateStreamingStatus(
     workspaceId: string,
     streaming: boolean,
-    model?: string,
-    agentId?: string,
-    hasTodos?: boolean,
-    expectedGeneration?: number
+    update: ExtensionMetadataStreamingUpdate = {}
   ): Promise<void> {
     try {
-      let thinkingLevel: WorkspaceAISettings["thinkingLevel"] | undefined;
-      if (model) {
-        const found = this.config.findWorkspace(workspaceId);
-        if (found) {
-          const config = this.config.loadConfigOrDefault();
-          const project = config.projects.get(found.projectPath);
-          const workspace =
-            project?.workspaces.find((w) => w.id === workspaceId) ??
-            project?.workspaces.find((w) => w.path === found.workspacePath);
-          const normalizedAgentId =
-            typeof agentId === "string" && agentId.trim().length > 0
-              ? agentId.trim().toLowerCase()
-              : WORKSPACE_DEFAULTS.agentId;
-          const aiSettings =
-            workspace?.aiSettingsByAgent?.[normalizedAgentId] ?? workspace?.aiSettings;
-          thinkingLevel = aiSettings?.thinkingLevel;
-        }
-      }
+      let { hasTodos } = update;
       if (!streaming && hasTodos === undefined) {
         // Stop snapshots need an authoritative todo bit even for background workspaces,
         // and centralizing the read here preserves the fire-and-forget abort/error handlers.
@@ -1306,20 +1310,18 @@ export class WorkspaceService extends EventEmitter {
       }
       if (
         !streaming &&
-        expectedGeneration !== undefined &&
-        expectedGeneration !== (this.streamingGenerations.get(workspaceId) ?? 0)
+        update.generation !== undefined &&
+        update.generation !== (this.streamingGenerations.get(workspaceId) ?? 0)
       ) {
         // A newer stream has started since this stop was initiated, so dropping the stale
         // streaming=false write preserves the active stream's metadata snapshot.
         return;
       }
-      const snapshot = await this.extensionMetadata.setStreaming(
-        workspaceId,
-        streaming,
-        model,
-        thinkingLevel,
-        hasTodos
-      );
+
+      const snapshot = await this.extensionMetadata.setStreaming(workspaceId, streaming, {
+        ...update,
+        ...(hasTodos !== undefined ? { hasTodos } : {}),
+      });
       // Idle compaction tagging is stop-snapshot only. Never tag streaming=true updates,
       // otherwise fast follow-up turns can inherit stale idle metadata before cleanup runs.
       const shouldTagIdleCompaction = !streaming && this.idleCompactingWorkspaces.has(workspaceId);
@@ -1346,14 +1348,7 @@ export class WorkspaceService extends EventEmitter {
    */
   private stopStreamingStatus(workspaceId: string, capturedGeneration?: number): Promise<void> {
     const generation = capturedGeneration ?? this.streamingGenerations.get(workspaceId) ?? 0;
-    return this.updateStreamingStatus(
-      workspaceId,
-      false,
-      undefined,
-      undefined,
-      undefined,
-      generation
-    );
+    return this.updateStreamingStatus(workspaceId, false, { generation });
   }
 
   private async handleStreamCompletion(workspaceId: string): Promise<void> {
@@ -1458,6 +1453,27 @@ export class WorkspaceService extends EventEmitter {
     );
   }
 
+  private attachSessionSubscriptions(workspaceId: string, session: AgentSession): void {
+    const chatUnsubscribe = session.onChatEvent((event) => {
+      this.emit("chat", { workspaceId: event.workspaceId, message: event.message });
+      if (this.shouldClearAgentStatusFromChatMessage(event.message)) {
+        void this.updateAgentStatus(event.workspaceId, null);
+      }
+    });
+
+    const metadataUnsubscribe = session.onMetadataEvent((event) => {
+      this.emit("metadata", {
+        workspaceId: event.workspaceId,
+        metadata: event.metadata!,
+      });
+    });
+
+    this.sessionSubscriptions.set(workspaceId, {
+      chat: chatUnsubscribe,
+      metadata: metadataUnsubscribe,
+    });
+  }
+
   public getOrCreateSession(workspaceId: string): AgentSession {
     assert(typeof workspaceId === "string", "workspaceId must be a string");
     const trimmed = workspaceId.trim();
@@ -1484,25 +1500,8 @@ export class WorkspaceService extends EventEmitter {
       },
     });
 
-    const chatUnsubscribe = session.onChatEvent((event) => {
-      this.emit("chat", { workspaceId: event.workspaceId, message: event.message });
-      if (this.shouldClearAgentStatusFromChatMessage(event.message)) {
-        void this.updateAgentStatus(event.workspaceId, null);
-      }
-    });
-
-    const metadataUnsubscribe = session.onMetadataEvent((event) => {
-      this.emit("metadata", {
-        workspaceId: event.workspaceId,
-        metadata: event.metadata!,
-      });
-    });
-
     this.sessions.set(trimmed, session);
-    this.sessionSubscriptions.set(trimmed, {
-      chat: chatUnsubscribe,
-      metadata: metadataUnsubscribe,
-    });
+    this.attachSessionSubscriptions(trimmed, session);
 
     return session;
   }
@@ -1519,25 +1518,7 @@ export class WorkspaceService extends EventEmitter {
     assert(!this.sessions.has(workspaceId), `session already registered for ${workspaceId}`);
 
     this.sessions.set(workspaceId, session);
-
-    const chatUnsubscribe = session.onChatEvent((event) => {
-      this.emit("chat", { workspaceId: event.workspaceId, message: event.message });
-      if (this.shouldClearAgentStatusFromChatMessage(event.message)) {
-        void this.updateAgentStatus(event.workspaceId, null);
-      }
-    });
-
-    const metadataUnsubscribe = session.onMetadataEvent((event) => {
-      this.emit("metadata", {
-        workspaceId: event.workspaceId,
-        metadata: event.metadata!,
-      });
-    });
-
-    this.sessionSubscriptions.set(workspaceId, {
-      chat: chatUnsubscribe,
-      metadata: metadataUnsubscribe,
-    });
+    this.attachSessionSubscriptions(workspaceId, session);
   }
 
   public disposeSession(workspaceId: string): void {
@@ -1841,6 +1822,11 @@ export class WorkspaceService extends EventEmitter {
         }
       }
 
+      const createEnv = await secretsToRecord(
+        this.config.getEffectiveSecrets(projectPath),
+        this.opResolver
+      );
+
       for (let attempt = 0; attempt <= MAX_WORKSPACE_NAME_COLLISION_RETRIES; attempt++) {
         createResult = await runtime.createWorkspace({
           projectPath,
@@ -1849,6 +1835,7 @@ export class WorkspaceService extends EventEmitter {
           directoryName: finalBranchName,
           initLogger,
           abortSignal: initAbortController.signal,
+          env: createEnv,
           trusted: projectConfig.trusted ?? false,
         });
 
@@ -2168,6 +2155,11 @@ export class WorkspaceService extends EventEmitter {
           `Expected non-empty trunk branch for project ${projectRuntimeEntry.project.projectPath}`
         );
 
+        const createEnv = await secretsToRecord(
+          this.config.getEffectiveSecrets(projectRuntimeEntry.project.projectPath),
+          this.opResolver
+        );
+
         const createResult = await projectRuntimeEntry.runtime.createWorkspace({
           projectPath: projectRuntimeEntry.project.projectPath,
           branchName,
@@ -2175,6 +2167,7 @@ export class WorkspaceService extends EventEmitter {
           directoryName: branchName,
           initLogger,
           abortSignal: initAbortController.signal,
+          env: createEnv,
           trusted,
         });
 
@@ -2718,6 +2711,11 @@ export class WorkspaceService extends EventEmitter {
 
       // Close any terminal sessions for this workspace
       this.terminalService?.closeWorkspaceSessions(workspaceId);
+      await this.closeDesktopSessionBestEffort(workspaceId, "remove");
+
+      // Close any browser sessions (tracked or raw CLI-started) for this workspace.
+      // Best-effort: failure logs internally but does not block removal.
+      await this.browserSessionService?.stopSession(workspaceId);
 
       // Remove from config
       await this.config.removeWorkspace(workspaceId);
@@ -3381,6 +3379,11 @@ export class WorkspaceService extends EventEmitter {
 
       // Archiving hides workspace UI; do not leave terminal PTYs running headless.
       this.terminalService?.closeWorkspaceSessions(workspaceId);
+      await this.closeDesktopSessionBestEffort(workspaceId, "archive");
+
+      // Close any browser sessions (tracked or raw CLI-started) for this workspace.
+      // Best-effort: failure logs internally but does not block archive.
+      await this.browserSessionService?.stopSession(workspaceId);
 
       await this.config.editConfig((config) => {
         const projectConfig = config.projects.get(projectPath);
@@ -4070,7 +4073,8 @@ export class WorkspaceService extends EventEmitter {
 
   async fork(
     sourceWorkspaceId: string,
-    newName?: string
+    newName?: string,
+    sourceMessageId?: string
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; projectPath: string }>> {
     try {
       if (sourceWorkspaceId === MUX_HELP_CHAT_WORKSPACE_ID) {
@@ -4185,6 +4189,23 @@ export class WorkspaceService extends EventEmitter {
       const initAbortController = new AbortController();
       this.initAbortControllers.set(newWorkspaceId, initAbortController);
 
+      const projectEnvCache = new Map<string, Record<string, string>>();
+      const resolveProjectEnv = async (runtimeProjectPath: string) => {
+        const normalizedRuntimeProjectPath = stripTrailingSlashes(runtimeProjectPath);
+        const cachedEnv = projectEnvCache.get(normalizedRuntimeProjectPath);
+        if (cachedEnv) {
+          return cachedEnv;
+        }
+
+        const projectEnv = await secretsToRecord(
+          this.config.getEffectiveSecrets(normalizedRuntimeProjectPath),
+          this.opResolver
+        );
+        projectEnvCache.set(normalizedRuntimeProjectPath, projectEnv);
+        return projectEnv;
+      };
+      const createEnv = await resolveProjectEnv(foundProjectPath);
+
       let forkResult: Awaited<ReturnType<typeof orchestrateFork>>;
       try {
         forkResult = await orchestrateFork({
@@ -4199,6 +4220,8 @@ export class WorkspaceService extends EventEmitter {
           parentMetadata: sourceMetadata,
           allowCreateFallback: false,
           abortSignal: initAbortController.signal,
+          env: createEnv,
+          projectEnvResolver: resolveProjectEnv,
           trusted: projectConfig.trusted ?? false,
           multiProjectExperimentEnabled: this.isExperimentEnabled(
             EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
@@ -4228,27 +4251,10 @@ export class WorkspaceService extends EventEmitter {
       // Run init for forked workspace (fire-and-forget like create()).
       // Multi-project forks need per-project secrets for each runtime's init hook.
       if (targetRuntime instanceof MultiProjectRuntime) {
-        const projectEnvCache = new Map<string, Record<string, string>>();
-        targetRuntime.envResolver = async (runtimeProjectPath: string) => {
-          const normalizedRuntimeProjectPath = stripTrailingSlashes(runtimeProjectPath);
-          const cachedEnv = projectEnvCache.get(normalizedRuntimeProjectPath);
-          if (cachedEnv) {
-            return cachedEnv;
-          }
-
-          const projectEnv = await secretsToRecord(
-            this.config.getEffectiveSecrets(normalizedRuntimeProjectPath),
-            this.opResolver
-          );
-          projectEnvCache.set(normalizedRuntimeProjectPath, projectEnv);
-          return projectEnv;
-        };
+        targetRuntime.envResolver = resolveProjectEnv;
       }
 
-      const secrets = await secretsToRecord(
-        this.config.getEffectiveSecrets(foundProjectPath),
-        this.opResolver
-      );
+      const secrets = await resolveProjectEnv(foundProjectPath);
       runBackgroundInit(
         targetRuntime,
         {
@@ -4271,18 +4277,40 @@ export class WorkspaceService extends EventEmitter {
       try {
         await ensurePrivateDir(newSessionDir);
 
-        const sessionFiles = [
-          "chat.jsonl",
-          "partial.json",
-          "session-timing.json",
-          "session-usage.json",
-        ] as const;
+        const sessionFiles = ["chat.jsonl", "partial.json", "session-timing.json"] as const;
         for (const fileName of sessionFiles) {
           await copyIfExists(
             path.join(sourceSessionDir, fileName),
             path.join(newSessionDir, fileName)
           );
         }
+
+        if (sourceMessageId) {
+          const truncateResult = await this.historyService.truncateAfterMessage(
+            newWorkspaceId,
+            sourceMessageId,
+            {
+              keepTargetMessage: true,
+            }
+          );
+          if (!truncateResult.success) {
+            throw new Error(truncateResult.error);
+          }
+
+          // Forking from a prior assistant response intentionally discards any later in-flight
+          // state so the new workspace resumes cleanly at the chosen branch point.
+          await fsPromises.rm(path.join(newSessionDir, "partial.json"), { force: true });
+          if (this.sessionTimingService) {
+            await this.sessionTimingService.clearTimingFile(newWorkspaceId);
+          } else {
+            await fsPromises.rm(path.join(newSessionDir, "session-timing.json"), { force: true });
+          }
+        }
+
+        // Forks inherit chat history, but their cost ledger must start fresh.
+        // Persist an explicit empty usage file so later reads do not rebuild
+        // historical costs from the copied messages.
+        await resetForkedSessionUsage(this.sessionUsageService, newWorkspaceId, newSessionDir);
       } catch (copyError) {
         const forkTrusted = projectConfig.trusted ?? false;
         await targetRuntime.deleteWorkspace(
@@ -5124,6 +5152,15 @@ export class WorkspaceService extends EventEmitter {
       log.error("Unexpected error in clearQueue handler:", error);
       return Err(`Failed to clear queue: ${errorMessage}`);
     }
+  }
+
+  hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean {
+    const session = this.sessions.get(workspaceId.trim());
+    if (!session) {
+      return false;
+    }
+
+    return session.hasQueuedMessages() || session.isPreparingTurn();
   }
 
   /**
@@ -6110,7 +6147,7 @@ export class WorkspaceService extends EventEmitter {
         })()
       : undefined;
 
-    const activity = await this.extensionMetadata.getMetadata(workspaceId);
+    const activity = await this.extensionMetadata.getSnapshot(workspaceId);
 
     const compactAgentSettings = workspaceEntry?.aiSettingsByAgent?.compact;
     const execAgentSettings =

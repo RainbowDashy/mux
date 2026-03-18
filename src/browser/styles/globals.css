@@ -114,6 +114,8 @@
     --color-text: hsl(0 0% 83%);
     --color-text-light: hsl(0 0% 73%);
     --color-text-secondary: hsl(0 0% 42%);
+    --color-content-primary: hsl(0 0% 100%);
+    --color-content-secondary: hsla(240, 5%, 65%);
     --color-muted-foreground: hsl(0 0% 60%);
     --color-secondary: hsl(0 0% 42%);
     --color-surface-primary: hsla(240, 10%, 4%, 1);
@@ -250,7 +252,6 @@
     --color-label: hsl(0 0% 67%); /* #aaa - label */
     --color-gray: hsl(0 0% 48%); /* #7a7a7a - gray */
     --color-medium: hsl(0 0% 59%); /* #969696 - medium */
-
     --color-border-light: #262626; /* neutral-800 - borders */
     --color-border-medium: hsl(0 0% 27%); /* #444 - medium borders */
     --color-border-darker: hsl(0 0% 33%); /* #555 - darker borders */
@@ -275,6 +276,7 @@
     --color-accent-dark: hsl(207 100% 37%); /* #0e639c - darker accent */
     --color-accent-darker: hsl(202 100% 23%); /* #094771 - even darker accent */
     --color-accent-light: hsl(198 100% 65%); /* #4db8ff - lighter accent */
+    --color-accent-foreground: hsl(0 0% 100%); /* readable text/icons on accent surfaces */
 
     --color-success: hsl(122 39% 49%); /* #4caf50 - success green */
     --color-success-light: hsl(123 46% 64%); /* #4ade80 - lighter success */
@@ -413,6 +415,8 @@
   --color-text: hsl(210 18% 16%);
   --color-text-light: hsl(210 15% 28%);
   --color-text-secondary: hsl(210 12% 42%);
+  --color-content-primary: hsl(240 10% 4%);
+  --color-content-secondary: hsla(240, 5%, 34%);
   --color-muted-foreground: hsl(210 14% 48%);
   --color-secondary: hsl(210 18% 60%);
   --color-surface-primary: hsla(0, 0%, 100%, 1);
@@ -548,6 +552,7 @@
   --color-accent-dark: hsl(207 90% 38%);
   --color-accent-darker: hsl(204 92% 30%);
   --color-accent-light: hsl(198 100% 70%);
+  --color-accent-foreground: hsl(0 0% 100%); /* preserve contrast on blue buttons in light mode */
 
   --color-success: hsl(122 39% 45%);
   --color-success-light: hsl(123 46% 60%);
@@ -668,6 +673,8 @@
   --color-text: #100f0f;
   --color-text-light: #6f6e69;
   --color-text-secondary: #6f6e69;
+  --color-content-primary: #100f0f;
+  --color-content-secondary: #575653;
   --color-muted-foreground: #6f6e69;
   --color-secondary: #6f6e69;
   --color-surface-primary: #fffcf0;
@@ -791,6 +798,7 @@
   --color-accent-dark: color-mix(in srgb, var(--color-accent), black 14%);
   --color-accent-darker: color-mix(in srgb, var(--color-accent), black 24%);
   --color-accent-light: color-mix(in srgb, var(--color-accent), white 42%);
+  --color-accent-foreground: #fffcf0; /* high-contrast text on accent buttons */
 
   --color-success: #66800b;
   --color-success-light: color-mix(in srgb, var(--color-success), white 35%);
@@ -895,6 +903,8 @@
   --color-text: #cecdc3;
   --color-text-light: #878580;
   --color-text-secondary: #575653;
+  --color-content-primary: #fffcf0;
+  --color-content-secondary: #878580;
   --color-muted-foreground: #878580;
   --color-secondary: #575653;
   --color-surface-primary: #100f0f;
@@ -1018,6 +1028,7 @@
   --color-accent-dark: color-mix(in srgb, var(--color-accent), black 18%);
   --color-accent-darker: color-mix(in srgb, var(--color-accent), black 28%);
   --color-accent-light: color-mix(in srgb, var(--color-accent), white 22%);
+  --color-accent-foreground: #100f0f; /* maintain WCAG contrast against lighter Flexoki dark accent */
 
   --color-success: #879a39;
   --color-success-light: color-mix(in srgb, var(--color-success), white 22%);

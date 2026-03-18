@@ -23,6 +23,12 @@ import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
 import { getVisibleWorkspaceIds } from "./utils/ui/workspaceDomNav";
 import { useUnreadTracking } from "./hooks/useUnreadTracking";
 import { useWorkspaceStoreRaw, useWorkspaceRecency } from "./stores/WorkspaceStore";
+import {
+  getResponseCompleteNotificationBody,
+  shouldNotifyOnResponseComplete,
+  type ResponseCompleteEvent,
+} from "./utils/messages/responseCompletionMetadata";
+import { showBrowserNotification } from "./utils/ui/showBrowserNotification";
 
 import { useStableReference, compareMaps } from "./hooks/useStableReference";
 import { CommandRegistryProvider, useCommandRegistry } from "./contexts/CommandRegistryContext";
@@ -974,77 +980,53 @@ function AppInner() {
     // Callback for "notify on response" feature - fires when any assistant response completes.
     // Only notify when isFinal=true (assistant done with all work, no more active streams).
     // finalText is extracted by the aggregator (text after tool calls).
-    // compaction is provided when this was a compaction stream (includes continue metadata).
-    const handleResponseComplete = (
-      workspaceId: string,
-      _messageId: string,
-      isFinal: boolean,
-      finalText: string,
-      compaction?: { hasContinueMessage: boolean; isIdle?: boolean },
-      completedAt?: number | null
-    ) => {
-      // Only notify on final message (when assistant is done with all work)
-      if (!isFinal) return;
+    // completion carries notification-policy metadata (compaction vs normal response,
+    // and whether another queued/auto follow-up will immediately take over).
+    const handleResponseComplete = (event: ResponseCompleteEvent) => {
+      // Only notify on final message (when assistant is done with all work).
+      if (!event.isFinal) {
+        return;
+      }
 
       // Only mark read when the user is actively viewing this workspace's chat.
       // Checking currentWorkspaceIdRef ensures we don't advance lastRead when
       // a non-chat route (e.g. /settings) is active — the workspace remains
       // "selected" but the chat content is not visible.
-      const isChatVisible = document.hasFocus() && currentWorkspaceIdRef.current === workspaceId;
-      if (completedAt != null && isChatVisible) {
-        updatePersistedState(getWorkspaceLastReadKey(workspaceId), completedAt);
+      const isChatVisible =
+        document.hasFocus() && currentWorkspaceIdRef.current === event.workspaceId;
+      if (event.completedAt != null && isChatVisible) {
+        updatePersistedState(getWorkspaceLastReadKey(event.workspaceId), event.completedAt);
       }
 
-      // Skip notification for idle compaction (background maintenance, not user-initiated).
-      if (compaction?.isIdle) return;
-
-      // Skip notification if compaction completed with a continue message.
-      // We use the compaction metadata instead of queued state since the queue
-      // can be drained before compaction finishes.
-      if (compaction?.hasContinueMessage) return;
+      if (!shouldNotifyOnResponseComplete(event.completion)) {
+        return;
+      }
 
       // Skip notification if the selected workspace is focused (Slack-like behavior).
       // Notification suppression intentionally follows selection state, not chat-route visibility.
       const isWorkspaceFocused =
-        document.hasFocus() && selectedWorkspaceRef.current?.workspaceId === workspaceId;
-      if (isWorkspaceFocused) return;
-
-      // Check if notifications are enabled for this workspace
-      const notifyEnabled = readPersistedState(getNotifyOnResponseKey(workspaceId), false);
-      if (!notifyEnabled) return;
-
-      const metadata = workspaceMetadataRef.current.get(workspaceId);
-      const title = metadata?.title ?? metadata?.name ?? "Response complete";
-
-      // For compaction completions, use a specific message instead of the summary text
-      const body = compaction
-        ? "Compaction complete"
-        : finalText
-          ? finalText.length > 200
-            ? `${finalText.slice(0, 197)}…`
-            : finalText
-          : "Response complete";
-
-      // Send browser notification
-      if ("Notification" in window) {
-        const showNotification = () => {
-          const notification = new Notification(title, { body });
-          notification.onclick = () => {
-            window.focus();
-            navigateToWorkspace(workspaceId);
-          };
-        };
-
-        if (Notification.permission === "granted") {
-          showNotification();
-        } else if (Notification.permission !== "denied") {
-          void Notification.requestPermission().then((perm) => {
-            if (perm === "granted") {
-              showNotification();
-            }
-          });
-        }
+        document.hasFocus() && selectedWorkspaceRef.current?.workspaceId === event.workspaceId;
+      if (isWorkspaceFocused) {
+        return;
       }
+
+      // Check if notifications are enabled for this workspace.
+      const notifyEnabled = readPersistedState(getNotifyOnResponseKey(event.workspaceId), false);
+      if (!notifyEnabled) {
+        return;
+      }
+
+      const metadata = workspaceMetadataRef.current.get(event.workspaceId);
+      const title = metadata?.title ?? metadata?.name ?? "Response complete";
+      const body = getResponseCompleteNotificationBody(event.finalText, event.completion);
+
+      showBrowserNotification(title, {
+        body,
+        onClick: () => {
+          window.focus();
+          navigateToWorkspace(event.workspaceId);
+        },
+      });
     };
 
     workspaceStore.setOnResponseComplete(handleResponseComplete);

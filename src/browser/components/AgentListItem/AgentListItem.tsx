@@ -3,11 +3,18 @@ import { stopKeyboardPropagation } from "@/browser/utils/events";
 import type { AgentRowRenderMeta } from "@/browser/utils/ui/workspaceFiltering";
 import { cn } from "@/common/lib/utils";
 import { useRuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceUnread } from "@/browser/hooks/useWorkspaceUnread";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { useWorkspaceFallbackModel } from "@/browser/hooks/useWorkspaceFallbackModel";
+import {
+  TASK_GROUP_KIND,
+  getTaskGroupKindFromMetadata,
+  normalizeTaskGroupLabel,
+} from "@/common/utils/tools/taskGroups";
 import { MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
 import { isDevcontainerRuntime } from "@/common/types/runtime";
+import { getWorkspaceLastReadKey } from "@/common/constants/storage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useDrag } from "react-dnd";
@@ -165,6 +172,9 @@ function isStatusDotVisible(state: VisualState, isDraft?: boolean, isSubAgent?: 
   return true;
 }
 
+const LEADING_SLOT_CONTAINER_CLASSES =
+  "relative z-20 flex h-4 w-4 shrink-0 items-center justify-center self-center";
+
 function StatusDot(props: {
   state: VisualState;
   isDraft?: boolean;
@@ -201,7 +211,7 @@ function StatusDot(props: {
     <div
       // Keep the status dot above sub-agent connector overlays so branch lines do
       // not draw across the dot when rows are nested.
-      className="relative z-20 flex h-4 w-4 shrink-0 items-center justify-center self-center"
+      className={LEADING_SLOT_CONTAINER_CLASSES}
     >
       {dot}
       {props.overlay && (
@@ -209,6 +219,33 @@ function StatusDot(props: {
           {props.overlay}
         </span>
       )}
+    </div>
+  );
+}
+
+function QuickArchiveButton(props: {
+  displayTitle: string;
+  onArchiveWorkspace: (button: HTMLElement) => void;
+}) {
+  return (
+    <div className={LEADING_SLOT_CONTAINER_CLASSES}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            className="text-muted hover:text-foreground focus-visible:text-foreground pointer-events-none inline-flex h-4 w-4 cursor-pointer items-center justify-center border-none bg-transparent p-0 opacity-0 transition-[color,opacity] duration-200 group-focus-within/row:pointer-events-auto group-focus-within/row:opacity-100 group-hover/row:pointer-events-auto group-hover/row:opacity-100"
+            onKeyDown={stopKeyboardPropagation}
+            onClick={(event) => {
+              event.stopPropagation();
+              props.onArchiveWorkspace(event.currentTarget);
+            }}
+            aria-label={`Archive workspace ${props.displayTitle}`}
+          >
+            <ArchiveIcon className="h-3 w-3 shrink-0" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="right">Archive chat</TooltipContent>
+      </Tooltip>
     </div>
   );
 }
@@ -269,12 +306,12 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
         <div className="flex min-w-0 items-center gap-1 text-[14px] leading-6">
           <PenLine
-            className={cn("h-3 w-3 shrink-0", isSelected ? "text-foreground" : "text-muted")}
+            className={cn("h-3 w-3 shrink-0", isSelected ? "text-content-primary" : "text-muted")}
           />
           <span
             className={cn(
               "min-w-0 truncate text-left italic",
-              isSelected ? "text-foreground" : "text-muted"
+              isSelected ? "text-content-primary" : "text-muted"
             )}
           >
             {draft.title}
@@ -284,7 +321,7 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
           <span
             className={cn(
               "block truncate text-left text-xs leading-4",
-              isSelected ? "text-foreground" : "text-muted"
+              isSelected ? "text-content-primary" : "text-muted"
             )}
           >
             {draft.promptPreview}
@@ -315,7 +352,7 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
               data-project-path={projectPath}
               data-draft-id={draft.draftId}
             >
-              <Trash className="h-3 w-3" />
+              <Trash />
             </button>
           </TooltipTrigger>
           <TooltipContent align="start">Delete draft</TooltipContent>
@@ -393,7 +430,12 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const [titleError, setTitleError] = useState<string | null>(null);
 
   // Display title (fallback to name for legacy workspaces without title)
-  const displayTitle = metadata.title ?? metadata.name;
+  const workspaceTitle = metadata.title ?? metadata.name;
+  const variantLabel =
+    getTaskGroupKindFromMetadata(metadata.bestOf) === TASK_GROUP_KIND.VARIANTS
+      ? normalizeTaskGroupLabel(metadata.bestOf?.label)
+      : undefined;
+  const displayTitle = variantLabel ? `${variantLabel} · ${workspaceTitle}` : workspaceTitle;
   const isEditing = editingWorkspaceId === workspaceId;
 
   const linkSharingEnabled = useLinkSharingEnabled();
@@ -442,11 +484,11 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     if (isEditing && !wasEditingRef.current) {
       // Initialize draft title exactly once per edit session so metadata refreshes
       // never overwrite what the user has typed in the input.
-      setEditingTitle(displayTitle);
+      setEditingTitle(workspaceTitle);
       setTitleError(null);
     }
     wasEditingRef.current = isEditing;
-  }, [isEditing, displayTitle]);
+  }, [isEditing, workspaceTitle]);
 
   const handleEditInputRef = useCallback((node: HTMLInputElement | null) => {
     if (!node) {
@@ -460,8 +502,8 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   // so it works even when the sidebar is collapsed and list items are unmounted.
 
   const startEditing = () => {
-    if (requestEdit(workspaceId, displayTitle)) {
-      setEditingTitle(displayTitle);
+    if (requestEdit(workspaceId, workspaceTitle)) {
+      setEditingTitle(workspaceTitle);
       setTitleError(null);
     }
   };
@@ -525,9 +567,12 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const showsVisibleStatusDot = isStatusDotVisible(visualState, false, isSubAgentRow);
   const hasStatusText =
     Boolean(agentStatus) || awaitingUserQuestion || isWorking || isInitializing || isRemoving;
+  // Keep archiving feedback inline with the title so the row doesn't jump to a
+  // two-line layout right before it disappears from the sidebar.
+  const shouldShowInlineArchivingStatus = isArchiving === true && !isRemoving;
   // Note: we intentionally render the secondary row even while the workspace is still
   // initializing so users can see early streaming/status information immediately.
-  const hasSecondaryRow = isArchiving === true || hasStatusText;
+  const hasSecondaryRow = !shouldShowInlineArchivingStatus && hasStatusText;
   const hasCompletedChildren =
     (rowRenderMeta?.hasHiddenCompletedChildren ?? false) ||
     (rowRenderMeta?.visibleCompletedChildrenCount ?? 0) > 0;
@@ -535,6 +580,15 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const isCompletedChildrenExpanded = completedChildrenExpanded === true;
   const showCompletedChildrenIndicator =
     canToggleCompletedChildren && isCompletedChildrenExpanded && !showsVisibleStatusDot;
+  // Keep one-click archive in the empty "seen" slot for regular workspaces, but leave
+  // sub-agents on the existing status-dot lifecycle because parent cleanup owns them.
+  const shouldShowQuickArchiveButton =
+    !isDisabled &&
+    !isEditing &&
+    !isMuxHelpChat &&
+    !isSubAgentRow &&
+    !showCompletedChildrenIndicator &&
+    !showsVisibleStatusDot;
   const toggleCompletedChildren = () => {
     if (!canToggleCompletedChildren) {
       return false;
@@ -544,6 +598,12 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   };
   const isDevcontainerWorkspace = isDevcontainerRuntime(metadata.runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
+  const titleColorClass =
+    !isSelected && visualState === "idle"
+      ? "text-content-primary"
+      : !isSelected && visualState === "seen"
+        ? "text-content-secondary"
+        : "text-content-primary";
 
   const paddingLeft = getItemPaddingLeft(depth);
 
@@ -579,6 +639,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         ref={drag}
         className={cn(
           LIST_ITEM_BASE_CLASSES,
+          "group/row",
           isDragging && "opacity-50",
           isRemoving && "opacity-70",
           // Keep hover styles enabled for initializing workspaces so the row feels interactive.
@@ -668,19 +729,28 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         data-workspace-id={workspaceId}
         data-section-id={sectionId ?? ""}
       >
-        <StatusDot
-          state={visualState}
-          isSubAgent={isSubAgentRow}
-          overlay={
-            showCompletedChildrenIndicator ? (
-              <ChevronDown
-                aria-hidden="true"
-                className="text-muted h-3 w-3"
-                data-testid={`completed-children-expanded-indicator-${workspaceId}`}
-              />
-            ) : undefined
-          }
-        />
+        {shouldShowQuickArchiveButton ? (
+          <QuickArchiveButton
+            displayTitle={displayTitle}
+            onArchiveWorkspace={(button) => {
+              void onArchiveWorkspace(workspaceId, button);
+            }}
+          />
+        ) : (
+          <StatusDot
+            state={visualState}
+            isSubAgent={isSubAgentRow}
+            overlay={
+              showCompletedChildrenIndicator ? (
+                <ChevronDown
+                  aria-hidden="true"
+                  className="text-muted h-3 w-3"
+                  data-testid={`completed-children-expanded-indicator-${workspaceId}`}
+                />
+              ) : undefined
+            }
+          />
+        )}
 
         {/* Action button: cancel/delete spinner for initializing workspaces, overflow menu otherwise */}
         {isInitializing ? (
@@ -711,11 +781,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   }
                   data-workspace-id={workspaceId}
                 >
-                  {isRemoving ? (
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                  ) : (
-                    <Trash2 className="h-3 w-3" />
-                  )}
+                  {isRemoving ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 />}
                 </button>
               </TooltipTrigger>
               <TooltipContent align="start">
@@ -759,7 +825,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                     aria-label={`Workspace actions for ${displayTitle}`}
                     data-workspace-id={workspaceId}
                   >
-                    <EllipsisVertical className="h-3 w-3" />
+                    <EllipsisVertical />
                   </button>
                 </PopoverTrigger>
 
@@ -768,7 +834,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   align={ctxMenu.position ? "start" : "end"}
                   side={ctxMenu.position ? "right" : "bottom"}
                   sideOffset={ctxMenu.position ? 0 : 6}
-                  className="w-[250px] !min-w-0 p-1"
+                  className="bg-surface-primary w-[250px] min-w-0! p-1"
                   onClick={(event: React.MouseEvent<HTMLDivElement>) => {
                     event.stopPropagation();
                   }}
@@ -795,6 +861,17 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                     linkSharingEnabled={linkSharingEnabled === true}
                     isMuxHelpChat={isMuxHelpChat}
                   />
+                  {!isSelected && !isUnread && (
+                    <PositionedMenuItem
+                      icon={<EyeOff />}
+                      label="Mark unread"
+                      onClick={() => {
+                        // Reset the read marker to epoch so existing activity is treated as unseen.
+                        updatePersistedState(getWorkspaceLastReadKey(workspaceId), 0);
+                        ctxMenu.close();
+                      }}
+                    />
+                  )}
                   {canToggleCompletedChildren && (
                     <PositionedMenuItem
                       icon={isCompletedChildrenExpanded ? <EyeOff /> : <Eye />}
@@ -865,10 +942,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
               <div className="flex min-w-0 items-center gap-1">
                 <span
                   className={cn(
-                    "text-foreground min-w-0 flex-1 truncate text-left text-[14px] leading-6 transition-colors duration-200",
+                    "min-w-0 flex-1 truncate text-left text-[14px] leading-6 transition-colors duration-200",
                     !isDisabled && "cursor-pointer",
                     isGeneratingTitle && "italic",
-                    !isSelected && visualState === "seen" && "text-secondary"
+                    titleColorClass
                   )}
                 >
                   {displayTitle}
@@ -878,34 +955,39 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
 
             {!isInitializing && !isEditing && (
               <div className="flex items-center gap-1">
-                {terminalActiveCount > 0 && (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <div className="text-muted flex items-center gap-0.5">
-                        <WorkspaceTerminalIcon className="h-3 w-3" />
-                        <span className="text-[11px]">{terminalActiveCount}</span>
-                      </div>
-                    </TooltipTrigger>
-                    <TooltipContent side="right">
-                      {terminalActiveCount} terminal{terminalActiveCount !== 1 ? "s" : ""} running
-                      commands
-                    </TooltipContent>
-                  </Tooltip>
+                {shouldShowInlineArchivingStatus ? (
+                  <div
+                    className="text-muted flex shrink-0 items-center gap-1 text-xs whitespace-nowrap"
+                    data-testid={`workspace-inline-archiving-status-${workspaceId}`}
+                  >
+                    <ArchiveIcon className="h-3 w-3 shrink-0" />
+                    <span>Archiving...</span>
+                  </div>
+                ) : (
+                  terminalActiveCount > 0 && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <div className="text-muted flex items-center gap-0.5">
+                          <WorkspaceTerminalIcon className="h-3 w-3" />
+                          <span className="text-[11px]">{terminalActiveCount}</span>
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent side="right">
+                        {terminalActiveCount} terminal{terminalActiveCount !== 1 ? "s" : ""} running
+                        commands
+                      </TooltipContent>
+                    </Tooltip>
+                  )
                 )}
               </div>
             )}
           </div>
           {hasSecondaryRow && (
-            <div className="min-w-0">
+            <div className="min-w-0" data-testid={`workspace-secondary-row-${workspaceId}`}>
               {isRemoving ? (
                 <div className="text-muted flex min-w-0 items-center gap-1.5 text-xs">
                   <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
                   <span className="min-w-0 truncate">Deleting...</span>
-                </div>
-              ) : isArchiving ? (
-                <div className="text-muted flex min-w-0 items-center gap-1.5 text-xs">
-                  <ArchiveIcon className="h-3 w-3 shrink-0" />
-                  <span className="min-w-0 truncate">Archiving...</span>
                 </div>
               ) : awaitingUserQuestion ? (
                 <div className="text-muted flex min-w-0 items-center gap-1.5 text-xs leading-4">

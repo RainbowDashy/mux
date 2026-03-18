@@ -76,7 +76,7 @@
 
             outputHashMode = "recursive";
             # Marker used by scripts/update_flake_hash.sh to update this hash in place.
-            outputHash = "sha256-WmCCFDmcFuJFyAX2pyT7vNV7xbfm19W96/3ycj4jm2A="; # mux-offline-cache-hash
+            outputHash = "sha256-2lSF1cQT4wlH92F93DNOwN87VR5G+w5U3SL5Eu38sRU="; # mux-offline-cache-hash
           };
 
           configurePhase = ''
@@ -111,6 +111,12 @@
                         cp -r dist $out/lib/mux/
                         cp -r node_modules $out/lib/mux/
                         cp package.json $out/lib/mux/
+
+                        # Ensure vendored binaries have execute permission.
+                        # agent-browser's postinstall normally does this, but
+                        # --ignore-scripts in offlineCache skips it, and the
+                        # Nix store is read-only at runtime so chmod is impossible.
+                        chmod +x $out/lib/mux/node_modules/agent-browser/bin/* 2>/dev/null || true
 
                         # Create wrapper script. When running in Nix, mux doesn't know that
                         # it's packaged. Use MUX_E2E_LOAD_DIST to force using compiled

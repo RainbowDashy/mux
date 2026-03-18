@@ -6,7 +6,8 @@
 #   make help          - Show all available targets
 #   make dev           - Start development server with hot reload
 #   make build         - Build all targets (parallel when possible)
-#   make static-check  - Run all static checks (lint + typecheck + fmt-check)
+#   make static-check  - Run fast local static checks (lint + typecheck + fmt-check)
+#   make static-check-full - Run the full CI static check suite
 #   make test          - Run tests
 #
 # Parallelism:
@@ -51,7 +52,7 @@ ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --out
 # Common esbuild flags for server runtime Docker bundle.
 # Place runtime bundles under dist/runtime so frontend dist/*.js layers remain stable.
 # External native modules (node-pty, ssh2) and electron remain runtime dependencies.
-ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:node-pty --external:electron --external:ssh2 --external:@1password/sdk --external:@1password/sdk-core --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify
+ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:node-pty --external:electron --external:ssh2 --external:@1password/sdk --external:@1password/sdk-core --external:agent-browser --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify
 
 # Common esbuild flags for tokenizer worker bundle used by server-bundle runtime.
 ESBUILD_TOKENIZER_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/tokenizer.worker.js --minify
@@ -61,7 +62,7 @@ include fmt.mk
 
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
-.PHONY: lint lint-fix typecheck typecheck-react-native mobile-web mobile-cors-proxy mobile-sandbox static-check
+.PHONY: lint lint-fix typecheck typecheck-react-native mobile-web mobile-cors-proxy mobile-sandbox static-check static-check-full
 .PHONY: test test-unit test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 check-appimage-icons
 .PHONY: vscode-ext vscode-ext-install
@@ -97,6 +98,7 @@ HAS_BROWSER_OPENER := $(shell command -v xdg-open >/dev/null 2>&1 && echo "yes" 
 STORYBOOK_OPEN_FLAG := $(if $(filter yes,$(HAS_BROWSER_OPENER)),,--no-open)
 
 DOCS_SOURCES := $(shell find docs -type f \( -name '*.mdx' -o -name '*.md' -o -name 'docs.json' \))
+BUILTIN_SKILL_SOURCES := $(shell find src/node/builtinSkills -type f | sort)
 
 TS_SOURCES := $(shell find src -type f \( -name '*.ts' -o -name '*.tsx' \))
 
@@ -213,7 +215,7 @@ BUILTIN_SKILLS_GENERATED := src/node/services/agentSkills/builtInSkillContent.ge
 $(BUILTIN_AGENTS_GENERATED): src/node/builtinAgents/*.md scripts/generate-builtin-agents.sh
 	@./scripts/generate-builtin-agents.sh
 
-$(BUILTIN_SKILLS_GENERATED): src/node/builtinSkills/*.md $(DOCS_SOURCES) scripts/generate-builtin-skills.sh scripts/gen_builtin_skills.ts
+$(BUILTIN_SKILLS_GENERATED): $(BUILTIN_SKILL_SOURCES) $(DOCS_SOURCES) scripts/generate-builtin-skills.sh scripts/gen_builtin_skills.ts
 	@./scripts/generate-builtin-skills.sh
 
 dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED)
@@ -322,7 +324,11 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 	@bun scripts/generate-icons.ts png
 
 ## Quality checks (can run in parallel)
-static-check: lint typecheck fmt-check check-eager-imports check-bench-agent check-docs-links check-code-docs-links lint-shellcheck lint-hadolint ## Run all static checks (lint + typecheck + fmt-check)
+# Keep the default local path fast. Docs link crawling and lockfile-free bench-agent
+# verification stay in static-check-full so local validation remains responsive.
+static-check: lint typecheck fmt-check check-eager-imports check-code-docs-links lint-shellcheck lint-hadolint ## Run fast local static checks
+
+static-check-full: static-check check-bench-agent check-docs-links ## Run the full CI static check suite
 
 check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) ## Verify terminal-bench agent configuration and imports
 	@./scripts/check-bench-agent.sh

@@ -1,6 +1,6 @@
 {
   "name": "mux",
-  "version": "0.20.1",
+  "version": "0.21.0",
   "description": "mux - coder multiplexer",
   "author": "Coder",
   "main": "dist/cli/index.js",
@@ -66,6 +66,7 @@
     "@jitl/quickjs-wasmfile-release-asyncify": "^0.31.0",
     "@lydell/node-pty": "1.1.0",
     "@mozilla/readability": "^0.6.0",
+    "@novnc/novnc": "^1.6.0",
     "@openrouter/ai-sdk-provider": "^2.1.1",
     "@orpc/client": "^1.11.3",
     "@orpc/openapi": "^1.12.2",
@@ -88,6 +89,7 @@
     "@radix-ui/react-visually-hidden": "^1.2.4",
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
+    "agent-browser": "^0.20.14",
     "ai": "^6.0.72",
     "ai-tokenizer": "^1.0.6",
     "chalk": "^5.6.2",
@@ -179,7 +181,6 @@
     "@typescript-eslint/parser": "^8.44.1",
     "@typescript/native-preview": "^7.0.0-dev.20251014.1",
     "@vitejs/plugin-react": "^4.0.0",
-    "agent-browser": "^0.17.1",
     "autoprefixer": "^10.4.21",
     "babel-jest": "^30.2.0",
     "babel-plugin-react-compiler": "^1.0.0",
@@ -278,6 +279,7 @@
     "asarUnpack": [
       "dist/**/*.wasm",
       "dist/**/*.map",
+      "**/node_modules/agent-browser/bin/agent-browser*",
       "**/node_modules/node-pty/build/**/*",
       "**/node_modules/@duckdb/**/*.node"
     ],

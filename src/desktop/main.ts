@@ -4,6 +4,17 @@ process.umask(0o077);
 
 // Enable source map support for better error stack traces in production
 import "source-map-support/register";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { getMuxHome, migrateLegacyMuxHome } from "@/common/constants/paths";
+
+interface AgentBrowserLauncherModule {
+  generateAgentBrowserWrapper: () => {
+    dir: string;
+    posixContent: string;
+    windowsContent: string;
+  };
+}
 
 // Fix PATH on macOS when launched from Finder (not terminal).
 // GUI apps inherit minimal PATH from launchd, missing Homebrew tools like git-lfs.
@@ -17,6 +28,44 @@ if (process.platform === "darwin") {
     console.debug("[fix-path] Failed to enrich PATH:", e);
   }
 }
+
+function materializeVendoredBinWrappers(): void {
+  try {
+    const { generateAgentBrowserWrapper } =
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      require("@/node/services/agentBrowserLauncher") as AgentBrowserLauncherModule;
+    const { dir, posixContent, windowsContent } = generateAgentBrowserWrapper();
+
+    fs.mkdirSync(dir, { recursive: true });
+
+    const wrapperPath =
+      process.platform === "win32"
+        ? path.join(dir, "agent-browser.cmd")
+        : path.join(dir, "agent-browser");
+    fs.writeFileSync(wrapperPath, process.platform === "win32" ? windowsContent : posixContent);
+
+    if (process.platform !== "win32") {
+      fs.chmodSync(wrapperPath, 0o755);
+    }
+
+    process.env.MUX_VENDORED_BIN_DIR = dir;
+    process.env.PATH = process.env.PATH ? `${dir}${path.delimiter}${process.env.PATH}` : dir;
+  } catch (error) {
+    // Startup initialization must never crash the app.
+    console.debug("[vendored-bin] Failed to materialize agent-browser wrapper:", error);
+  }
+}
+
+// Migrate ~/.cmux before wrapper materialization because the wrappers resolve getMuxHome(),
+// which creates ~/.mux/bin and would make the migration incorrectly treat the new home as existing.
+try {
+  migrateLegacyMuxHome();
+} catch (error) {
+  // Startup initialization must never crash the app.
+  console.debug("[mux-home] Failed to migrate legacy mux home:", error);
+}
+
+materializeVendoredBinWrappers();
 
 import { randomBytes } from "crypto";
 import { RPCHandler } from "@orpc/server/message-port";
@@ -52,12 +101,9 @@ crashReporter.start({ uploadToServer: false });
 // Must be called before app.whenReady().
 app.commandLine.appendSwitch("js-flags", "--max-old-space-size=8192");
 
-import * as fs from "fs";
-import * as path from "path";
 import type { Config } from "../node/config";
 import type { ServiceContainer } from "../node/services/serviceContainer";
 import { VERSION } from "../version";
-import { getMuxHome, migrateLegacyMuxHome } from "../common/constants/paths";
 import type { MuxDeepLinkPayload } from "../common/types/deepLink";
 import type { UpdateStatus } from "../common/orpc/types";
 import { parseMuxDeepLink } from "../common/utils/deepLink";
@@ -594,6 +640,14 @@ async function loadServices(): Promise<void> {
   // Store auth token so the API server can be restarted via Settings.
   services.serverService.setApiAuthToken(authToken);
 
+  // Keep PATH-related recovery honest: Settings can re-check the current process view, but
+  // shell/profile changes made after launch still need a full app relaunch to rerun startup PATH setup.
+  services.windowService.setRestartAppHandler(() => {
+    assert(app, "Electron app must be available to restart mux");
+    app.relaunch();
+    app.quit();
+  });
+
   // Single router instance with auth middleware - used for both MessagePort and HTTP/WS
   const orpcRouter = router(authToken);
 
@@ -1058,7 +1112,7 @@ if (gotTheLock) {
 
       registerMuxProtocolClient();
 
-      // Migrate from .cmux to .mux directory structure if needed
+      // Safe to retry after ready: migrateLegacyMuxHome() is idempotent and returns once ~/.mux exists.
       migrateLegacyMuxHome();
 
       // Install React DevTools in development

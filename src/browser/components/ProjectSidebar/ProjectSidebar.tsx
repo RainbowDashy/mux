@@ -62,11 +62,26 @@ import { ProjectDeleteConfirmationModal } from "../ProjectDeleteConfirmationModa
 import { useSettings } from "@/browser/contexts/SettingsContext";
 
 import { AgentListItem, type WorkspaceSelection } from "../AgentListItem/AgentListItem";
+import { TaskGroupListItem } from "./TaskGroupListItem";
 import { WorkspaceStatusIndicator } from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
 import { TitleEditProvider, useTitleEdit } from "@/browser/contexts/WorkspaceTitleEditContext";
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
-import { ChevronRight, CircleHelp, KeyRound } from "lucide-react";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
+import {
+  PositionedMenu,
+  PositionedMenuItem,
+} from "@/browser/components/PositionedMenu/PositionedMenu";
+import {
+  ChevronRight,
+  CircleHelp,
+  EllipsisVertical,
+  KeyRound,
+  Pencil,
+  Trash,
+  Plus,
+} from "lucide-react";
 import { MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -79,11 +94,14 @@ import { WorkspaceSectionDropZone } from "../WorkspaceSectionDropZone/WorkspaceS
 import { WorkspaceDragLayer } from "../WorkspaceDragLayer/WorkspaceDragLayer";
 import { SectionDragLayer } from "../SectionDragLayer/SectionDragLayer";
 import { DraggableSection } from "../DraggableSection/DraggableSection";
+import { Separator } from "../Separator/Separator";
 import type { SectionConfig } from "@/common/types/project";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
+import { getTaskGroupKindFromMetadata } from "@/common/utils/tools/taskGroups";
+import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
@@ -133,6 +151,24 @@ const MuxChatHelpButton: React.FC<{
 const PROJECT_ITEM_BASE_CLASS =
   "sticky top-0 z-10 py-2 pl-2 pr-3 flex select-none items-center border-l-transparent bg-surface-primary transition-colors duration-150";
 
+function getProjectFallbackLabel(projectPath: string): string {
+  const abbreviatedPath = PlatformPaths.abbreviate(projectPath);
+  const { basename } = PlatformPaths.splitAbbreviated(abbreviatedPath);
+  return basename;
+}
+
+function getProjectNameFromPath(path: string): string {
+  if (!path || typeof path !== "string") {
+    return "Unknown";
+  }
+  return PlatformPaths.getProjectName(path);
+}
+
+function normalizeDisplayNameInput(value: string): string | null {
+  const trimmedValue = value.trim();
+  return trimmedValue.length > 0 ? trimmedValue : null;
+}
+
 function getProjectItemClassName(opts: {
   isDragging: boolean;
   isOver: boolean;
@@ -151,6 +187,10 @@ type DraggableProjectItemProps = React.PropsWithChildren<{
   onReorder: (draggedPath: string, targetPath: string) => void;
   selected?: boolean;
   onClick?: () => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
+  onTouchStart?: (e: React.TouchEvent) => void;
+  onTouchEnd?: (e: React.TouchEvent) => void;
+  onTouchMove?: (e: React.TouchEvent) => void;
   onKeyDown?: (e: React.KeyboardEvent) => void;
   role?: string;
   tabIndex?: number;
@@ -209,13 +249,7 @@ const DraggableProjectItemBase: React.FC<DraggableProjectItemProps> = ({
   );
 };
 
-const DraggableProjectItem = React.memo(
-  DraggableProjectItemBase,
-  (prev, next) =>
-    prev.projectPath === next.projectPath &&
-    prev.onReorder === next.onReorder &&
-    (prev["aria-expanded"] ?? false) === (next["aria-expanded"] ?? false)
-);
+const DraggableProjectItem = DraggableProjectItemBase;
 /**
  * Wrapper that fetches draft data from localStorage and renders via unified AgentListItem.
  * Keeps data-fetching logic colocated with sidebar while delegating rendering to shared component.
@@ -468,6 +502,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     userProjects,
     openProjectCreateModal: onAddProject,
     removeProject: onRemoveProject,
+    updateDisplayName,
     createSection,
     updateSection,
     removeSection,
@@ -654,6 +689,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       .map(([workspaceId]) => workspaceId)
   );
 
+  const [expandedTaskGroups, setExpandedTaskGroups] = useState<Record<string, boolean>>({});
+  const toggleTaskGroupExpansion = (groupId: string) => {
+    setExpandedTaskGroups((prev) => ({
+      ...prev,
+      [groupId]: !prev[groupId],
+    }));
+  };
+
   const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<Set<string>>(new Set());
   const [removingWorkspaceIds, setRemovingWorkspaceIds] = useState<Set<string>>(new Set());
   const workspaceArchiveError = usePopoverError();
@@ -674,12 +717,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const projectRemoveError = usePopoverError();
   const sectionRemoveError = usePopoverError();
 
-  const getProjectName = (path: string) => {
-    if (!path || typeof path !== "string") {
-      return "Unknown";
-    }
-    return PlatformPaths.getProjectName(path);
-  };
+  const projectContextMenu = useContextMenuPosition({ longPress: true });
+  const [projectMenuTargetPath, setProjectMenuTargetPath] = useState<string | null>(null);
+  const [editingProjectPath, setEditingProjectPath] = useState<string | null>(null);
+  const [editingProjectDisplayName, setEditingProjectDisplayName] = useState("");
+  const skipNextProjectNameBlurCommitRef = useRef(false);
 
   // Use functional update to avoid stale closure issues when clicking rapidly
   const toggleProject = useCallback(
@@ -993,16 +1035,141 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     }
   };
 
-  const handleOpenSecrets = (projectPath: string) => {
-    // Collapse the off-canvas sidebar on mobile before navigating so the
-    // settings page is immediately accessible without a backdrop blocking it.
-    if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
-      persistMobileSidebarScrollTop(mobileScrollTopRef.current);
-      onToggleCollapsed();
+  const handleOpenSecrets = useCallback(
+    (projectPath: string) => {
+      // Collapse the off-canvas sidebar on mobile before navigating so the
+      // settings page is immediately accessible without a backdrop blocking it.
+      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
+        persistMobileSidebarScrollTop(mobileScrollTopRef.current);
+        onToggleCollapsed();
+      }
+      // Navigate to Settings → Secrets with the project pre-selected.
+      settings.open("secrets", { secretsProjectPath: projectPath });
+    },
+    [MOBILE_BREAKPOINT, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop, settings]
+  );
+
+  const closeProjectContextMenu = useCallback(() => {
+    projectContextMenu.close();
+    setProjectMenuTargetPath(null);
+  }, [projectContextMenu]);
+
+  const handleProjectMenuOpenChange = useCallback(
+    (open: boolean) => {
+      projectContextMenu.onOpenChange(open);
+      if (!open) {
+        setProjectMenuTargetPath(null);
+      }
+    },
+    [projectContextMenu]
+  );
+
+  const handleOpenProjectMenu = useCallback(
+    (event: React.MouseEvent, projectPath: string) => {
+      setProjectMenuTargetPath(projectPath);
+      projectContextMenu.onContextMenu(event);
+    },
+    [projectContextMenu]
+  );
+
+  const handleProjectContextMenuTouchStart = useCallback(
+    (event: React.TouchEvent, projectPath: string) => {
+      setProjectMenuTargetPath(projectPath);
+      projectContextMenu.touchHandlers.onTouchStart(event);
+    },
+    [projectContextMenu]
+  );
+
+  const handleRequestProjectRemoval = useCallback(
+    (projectPath: string, buttonElement?: HTMLElement) => {
+      const projectConfig = userProjects.get(projectPath);
+      if (!projectConfig) {
+        return;
+      }
+
+      const projectName = projectConfig.displayName ?? getProjectNameFromPath(projectPath);
+      const counts = getProjectWorkspaceCounts(projectConfig.workspaces);
+      const total = counts.activeCount + counts.archivedCount;
+      if (total > 0) {
+        setDeleteConfirmation({
+          projectPath,
+          projectName,
+          activeCount: counts.activeCount,
+          archivedCount: counts.archivedCount,
+        });
+        return;
+      }
+
+      void removeProjectWithFeedback(projectPath, undefined, buttonElement);
+    },
+    [removeProjectWithFeedback, userProjects]
+  );
+
+  const cancelProjectDisplayNameEditing = useCallback(() => {
+    setEditingProjectPath(null);
+    setEditingProjectDisplayName("");
+  }, []);
+
+  const commitProjectDisplayNameEdit = useCallback(
+    async (projectPath: string, nextDisplayName: string) => {
+      const normalizedDisplayName = normalizeDisplayNameInput(nextDisplayName);
+      const result = await updateDisplayName(projectPath, normalizedDisplayName);
+      if (!result.success) {
+        console.error("Failed to update project display name:", result.error);
+        return;
+      }
+      setEditingProjectPath((currentPath) => {
+        if (currentPath === projectPath) {
+          setEditingProjectDisplayName("");
+          return null;
+        }
+        return currentPath;
+      });
+    },
+    [updateDisplayName]
+  );
+
+  const handleProjectMenuEditName = useCallback(() => {
+    if (!projectMenuTargetPath) {
+      return;
     }
-    // Navigate to Settings → Secrets with the project pre-selected.
-    settings.open("secrets", { secretsProjectPath: projectPath });
-  };
+
+    const projectConfig = userProjects.get(projectMenuTargetPath);
+    if (!projectConfig) {
+      closeProjectContextMenu();
+      return;
+    }
+
+    // Escape can leave the skip-blur flag set when the input unmounts before a blur event fires.
+    // Clear it when a fresh edit session starts so the next blur commits as expected.
+    skipNextProjectNameBlurCommitRef.current = false;
+    const currentDisplayName =
+      projectConfig.displayName ?? getProjectFallbackLabel(projectMenuTargetPath);
+    setEditingProjectPath(projectMenuTargetPath);
+    setEditingProjectDisplayName(currentDisplayName);
+    closeProjectContextMenu();
+  }, [closeProjectContextMenu, projectMenuTargetPath, userProjects]);
+
+  const handleProjectMenuManageSecrets = useCallback(() => {
+    if (!projectMenuTargetPath) {
+      return;
+    }
+
+    handleOpenSecrets(projectMenuTargetPath);
+    closeProjectContextMenu();
+  }, [closeProjectContextMenu, handleOpenSecrets, projectMenuTargetPath]);
+
+  const handleProjectMenuDelete = useCallback(
+    (buttonElement?: HTMLElement) => {
+      if (!projectMenuTargetPath) {
+        return;
+      }
+
+      handleRequestProjectRemoval(projectMenuTargetPath, buttonElement);
+      closeProjectContextMenu();
+    },
+    [closeProjectContextMenu, handleRequestProjectRemoval, projectMenuTargetPath]
+  );
 
   // UI preference: project order persists in localStorage
   const [projectOrder, setProjectOrder] = usePersistedState<string[]>("mux:projectOrder", []);
@@ -1084,6 +1251,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     },
     [projectOrder, userProjects, setProjectOrder]
   );
+
+  const hasProjectMenuTarget = projectMenuTargetPath !== null;
 
   // Handle keyboard shortcuts
   useEffect(() => {
@@ -1247,13 +1416,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   sortedProjectPaths.map((projectPath) => {
                     const config = userProjects.get(projectPath);
                     if (!config) return null;
-                    const projectName = getProjectName(projectPath);
+                    const projectName = getProjectNameFromPath(projectPath);
                     const sanitizedProjectId =
                       projectPath.replace(/[^a-zA-Z0-9_-]/g, "-") || "root";
                     const workspaceListId = `workspace-list-${sanitizedProjectId}`;
                     const isExpanded = expandedProjectsList.includes(projectPath);
-                    const counts = getProjectWorkspaceCounts(config.workspaces);
-                    const removeTooltip = "Remove project";
+                    const displayProjectName =
+                      config.displayName ?? getProjectFallbackLabel(projectPath);
+                    const isEditingProjectDisplayName = editingProjectPath === projectPath;
 
                     return (
                       <div key={projectPath} className="border-hover border-b">
@@ -1261,7 +1431,21 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                           projectPath={projectPath}
                           onReorder={handleReorder}
                           selected={false}
-                          onClick={() => handleAddWorkspace(projectPath)}
+                          onClick={() => {
+                            if (projectContextMenu.suppressClickIfLongPress()) {
+                              return;
+                            }
+                            if (isEditingProjectDisplayName) {
+                              return;
+                            }
+                            handleAddWorkspace(projectPath);
+                          }}
+                          onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
+                          onTouchStart={(event) =>
+                            handleProjectContextMenuTouchStart(event, projectPath)
+                          }
+                          onTouchEnd={projectContextMenu.touchHandlers.onTouchEnd}
+                          onTouchMove={projectContextMenu.touchHandlers.onTouchMove}
                           onKeyDown={(e: React.KeyboardEvent) => {
                             // Ignore key events from child buttons
                             if (e.target instanceof HTMLElement && e.target !== e.currentTarget) {
@@ -1294,20 +1478,57 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               style={{ transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" }}
                             />
                           </button>
-                          <div className="flex min-w-0 flex-1 items-center pr-2">
+                          <div
+                            className="flex min-w-0 flex-1 items-center pr-2"
+                            onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
+                          >
                             <Tooltip>
                               <TooltipTrigger asChild>
-                                <div className="text-muted-dark flex gap-2 truncate text-sm">
-                                  {(() => {
-                                    const abbrevPath = PlatformPaths.abbreviate(projectPath);
-                                    const { basename } = PlatformPaths.splitAbbreviated(abbrevPath);
-                                    return (
-                                      <span className="text-foreground truncate font-medium">
-                                        {basename}
-                                      </span>
-                                    );
-                                  })()}
-                                </div>
+                                {isEditingProjectDisplayName ? (
+                                  <input
+                                    value={editingProjectDisplayName}
+                                    autoFocus
+                                    aria-label={`Edit project name for ${projectName}`}
+                                    className="bg-background text-foreground border-border-light h-6 w-full rounded border px-2 text-sm"
+                                    onClick={(event) => event.stopPropagation()}
+                                    onMouseDown={(event) => event.stopPropagation()}
+                                    onContextMenu={(event) => event.stopPropagation()}
+                                    onChange={(event) => {
+                                      setEditingProjectDisplayName(event.target.value);
+                                    }}
+                                    onKeyDown={(event) => {
+                                      stopKeyboardPropagation(event);
+                                      if (event.key === "Escape") {
+                                        event.preventDefault();
+                                        skipNextProjectNameBlurCommitRef.current = true;
+                                        cancelProjectDisplayNameEditing();
+                                        return;
+                                      }
+
+                                      if (event.key === "Enter") {
+                                        event.preventDefault();
+                                        event.currentTarget.blur();
+                                      }
+                                    }}
+                                    onBlur={(event) => {
+                                      event.stopPropagation();
+                                      if (skipNextProjectNameBlurCommitRef.current) {
+                                        skipNextProjectNameBlurCommitRef.current = false;
+                                        return;
+                                      }
+                                      void commitProjectDisplayNameEdit(
+                                        projectPath,
+                                        event.currentTarget.value
+                                      );
+                                    }}
+                                  />
+                                ) : (
+                                  <div className="text-muted-dark flex gap-2 truncate text-sm">
+                                    <span className="text-foreground truncate font-medium">
+                                      {displayProjectName}
+                                    </span>
+                                  </div>
+                                )}
                               </TooltipTrigger>
                               <TooltipContent align="start">{projectPath}</TooltipContent>
                             </Tooltip>
@@ -1317,71 +1538,34 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               <button
                                 onClick={(event) => {
                                   event.stopPropagation();
-                                  handleOpenSecrets(projectPath);
-                                }}
-                                aria-label={`Manage secrets for ${projectName}`}
-                                data-project-path={projectPath}
-                                className="text-muted-dark mr-1 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded-[3px] border-none bg-transparent text-sm opacity-0 transition-all duration-200 hover:bg-yellow-500/10 hover:text-yellow-500 [@media(max-width:768px)_and_(hover:none)_and_(pointer:coarse)]:hidden [@media(min-width:769px)_and_(hover:none)_and_(pointer:coarse)]:opacity-100"
-                              >
-                                <KeyRound size={12} />
-                              </button>
-                            </TooltipTrigger>
-                            <TooltipContent align="end">Manage secrets</TooltipContent>
-                          </Tooltip>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <button
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  const buttonElement = event.currentTarget;
-                                  const total = counts.activeCount + counts.archivedCount;
-                                  if (total > 0) {
-                                    setDeleteConfirmation({
-                                      projectPath,
-                                      projectName,
-                                      activeCount: counts.activeCount,
-                                      archivedCount: counts.archivedCount,
-                                    });
-                                    return;
-                                  }
-
-                                  void removeProjectWithFeedback(
-                                    projectPath,
-                                    undefined,
-                                    buttonElement
-                                  );
-                                }}
-                                aria-label={`Remove project ${projectName}`}
-                                data-project-path={projectPath}
-                                className={cn(
-                                  "text-muted-dark mr-1 flex h-5 w-5 shrink-0 items-center justify-center rounded-[3px] border-none bg-transparent text-base opacity-0 transition-all duration-200",
-                                  "[@media(max-width:768px)_and_(hover:none)_and_(pointer:coarse)]:hidden",
-                                  "[@media(min-width:769px)_and_(hover:none)_and_(pointer:coarse)]:opacity-100",
-                                  "cursor-pointer hover:bg-danger-light/10 hover:text-danger-light"
-                                )}
-                              >
-                                ×
-                              </button>
-                            </TooltipTrigger>
-                            <TooltipContent align="end">{removeTooltip}</TooltipContent>
-                          </Tooltip>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <button
-                                onClick={(event) => {
-                                  event.stopPropagation();
                                   handleAddWorkspace(projectPath);
                                 }}
                                 aria-label={`New chat in ${projectName}`}
                                 data-project-path={projectPath}
-                                className="text-secondary hover:bg-hover hover:border-border-light flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent text-sm leading-none transition-all duration-200"
+                                className="text-content-secondary hover:bg-hover hover:border-border-light mr-1 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent text-sm leading-none transition-all duration-200"
                               >
-                                +
+                                <Plus />
                               </button>
                             </TooltipTrigger>
                             <TooltipContent>
                               New chat ({formatKeybind(KEYBINDS.NEW_WORKSPACE)})
                             </TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  handleOpenProjectMenu(event, projectPath);
+                                }}
+                                aria-label={`Project options for ${projectName}`}
+                                data-project-path={projectPath}
+                                className="text-content-secondary hover:bg-hover hover:border-border-light flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent transition-all duration-200"
+                              >
+                                <EllipsisVertical />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent align="end">Project options</TooltipContent>
                           </Tooltip>
                         </DraggableProjectItem>
 
@@ -1466,15 +1650,18 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               const renderWorkspace = (
                                 metadata: FrontendWorkspaceMetadata,
                                 sectionId?: string,
-                                rowRenderMetaOverride?: AgentRowRenderMeta
+                                rowRenderMetaOverride?: AgentRowRenderMeta | null,
+                                depthOverride?: number,
+                                keyOverride?: string
                               ) => {
                                 const rowRenderMeta =
-                                  rowRenderMetaOverride ??
-                                  baseRowMetaByWorkspaceId.get(metadata.id);
+                                  rowRenderMetaOverride === undefined
+                                    ? baseRowMetaByWorkspaceId.get(metadata.id)
+                                    : (rowRenderMetaOverride ?? undefined);
 
                                 return (
                                   <AgentListItem
-                                    key={metadata.id}
+                                    key={keyOverride ?? metadata.id}
                                     metadata={metadata}
                                     projectPath={projectPath}
                                     projectName={projectName}
@@ -1490,7 +1677,10 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                     onArchiveWorkspace={handleArchiveWorkspace}
                                     onCancelCreation={handleCancelWorkspaceCreation}
                                     depth={
-                                      rowRenderMeta?.depth ?? depthByWorkspaceId[metadata.id] ?? 0
+                                      depthOverride ??
+                                      rowRenderMeta?.depth ??
+                                      depthByWorkspaceId[metadata.id] ??
+                                      0
                                     }
                                     sectionId={sectionId}
                                     rowRenderMeta={rowRenderMeta}
@@ -1500,6 +1690,225 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                     onToggleCompletedChildren={toggleCompletedChildrenExpansion}
                                   />
                                 );
+                              };
+
+                              const renderWorkspaceRowsWithTaskGroupCoalescing = ({
+                                rows,
+                                allRows,
+                                sectionId,
+                                rowMetaByWorkspaceId,
+                              }: {
+                                rows: FrontendWorkspaceMetadata[];
+                                allRows: FrontendWorkspaceMetadata[];
+                                sectionId?: string;
+                                rowMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
+                              }): React.ReactNode[] => {
+                                if (rows.length === 0) {
+                                  return [];
+                                }
+
+                                const childrenByParentId = new Map<
+                                  string,
+                                  FrontendWorkspaceMetadata[]
+                                >();
+                                for (const workspace of allRows) {
+                                  const parentId = workspace.parentWorkspaceId;
+                                  if (!parentId) {
+                                    continue;
+                                  }
+                                  const children = childrenByParentId.get(parentId) ?? [];
+                                  children.push(workspace);
+                                  childrenByParentId.set(parentId, children);
+                                }
+
+                                const getTaskGroupId = (
+                                  workspace: FrontendWorkspaceMetadata
+                                ): string | null => {
+                                  const groupId = workspace.bestOf?.groupId;
+                                  if (!groupId || !workspace.parentWorkspaceId) {
+                                    return null;
+                                  }
+                                  if ((workspace.bestOf?.total ?? 1) < 2) {
+                                    return null;
+                                  }
+                                  const hasChildren = childrenByParentId.has(workspace.id);
+                                  return hasChildren ? null : groupId;
+                                };
+
+                                const allMembersByGroupId = new Map<
+                                  string,
+                                  FrontendWorkspaceMetadata[]
+                                >();
+                                for (const workspace of allRows) {
+                                  const groupId = getTaskGroupId(workspace);
+                                  if (!groupId) {
+                                    continue;
+                                  }
+                                  const group = allMembersByGroupId.get(groupId) ?? [];
+                                  group.push(workspace);
+                                  allMembersByGroupId.set(groupId, group);
+                                }
+
+                                const visibleMembersByGroupId = new Map<
+                                  string,
+                                  FrontendWorkspaceMetadata[]
+                                >();
+                                for (const workspace of rows) {
+                                  const groupId = getTaskGroupId(workspace);
+                                  if (!groupId) {
+                                    continue;
+                                  }
+                                  const group = visibleMembersByGroupId.get(groupId) ?? [];
+                                  group.push(workspace);
+                                  visibleMembersByGroupId.set(groupId, group);
+                                }
+
+                                const indexByWorkspaceId = new Map(
+                                  rows.map((workspace, index) => [workspace.id, index] as const)
+                                );
+                                const validGroupIds = new Set<string>();
+                                for (const [groupId, visibleMembers] of visibleMembersByGroupId) {
+                                  const allMembers = allMembersByGroupId.get(groupId) ?? [];
+                                  if (visibleMembers.length < 2 || allMembers.length < 2) {
+                                    continue;
+                                  }
+                                  const indices = visibleMembers
+                                    .map((workspace) => indexByWorkspaceId.get(workspace.id))
+                                    .filter((index): index is number => index != null);
+                                  if (indices.length !== visibleMembers.length) {
+                                    continue;
+                                  }
+                                  const firstIndex = Math.min(...indices);
+                                  const lastIndex = Math.max(...indices);
+                                  if (lastIndex - firstIndex + 1 !== visibleMembers.length) {
+                                    continue;
+                                  }
+                                  validGroupIds.add(groupId);
+                                }
+
+                                const skippedWorkspaceIds = new Set<string>();
+                                const renderedRows: React.ReactNode[] = [];
+
+                                for (const workspace of rows) {
+                                  if (skippedWorkspaceIds.has(workspace.id)) {
+                                    continue;
+                                  }
+
+                                  const taskGroupId = getTaskGroupId(workspace);
+                                  if (!taskGroupId || !validGroupIds.has(taskGroupId)) {
+                                    renderedRows.push(
+                                      renderWorkspace(
+                                        workspace,
+                                        sectionId,
+                                        rowMetaByWorkspaceId.get(workspace.id)
+                                      )
+                                    );
+                                    continue;
+                                  }
+
+                                  const visibleMembers =
+                                    visibleMembersByGroupId.get(taskGroupId) ?? [];
+                                  if (visibleMembers[0]?.id !== workspace.id) {
+                                    continue;
+                                  }
+
+                                  for (const member of visibleMembers) {
+                                    skippedWorkspaceIds.add(member.id);
+                                  }
+
+                                  const sortTaskGroupMembers = (
+                                    members: FrontendWorkspaceMetadata[]
+                                  ): FrontendWorkspaceMetadata[] => {
+                                    return [...members].sort(
+                                      (left, right) =>
+                                        (left.bestOf?.index ?? Number.MAX_SAFE_INTEGER) -
+                                          (right.bestOf?.index ?? Number.MAX_SAFE_INTEGER) ||
+                                        left.id.localeCompare(right.id)
+                                    );
+                                  };
+                                  const allMembers = sortTaskGroupMembers(
+                                    allMembersByGroupId.get(taskGroupId) ?? visibleMembers
+                                  );
+                                  const sortedVisibleMembers = sortTaskGroupMembers(visibleMembers);
+                                  const depth =
+                                    rowMetaByWorkspaceId.get(workspace.id)?.depth ??
+                                    depthByWorkspaceId[workspace.id] ??
+                                    0;
+                                  const totalCount = Math.max(
+                                    allMembers[0]?.bestOf?.total ?? allMembers.length,
+                                    allMembers.length
+                                  );
+                                  const groupKind = getTaskGroupKindFromMetadata(
+                                    allMembers[0]?.bestOf
+                                  );
+                                  let completedCount = 0;
+                                  let runningCount = 0;
+                                  let queuedCount = 0;
+                                  let interruptedCount = 0;
+                                  for (const member of allMembers) {
+                                    const hasCompletedReport = hasCompletedAgentReport(member);
+                                    if (hasCompletedReport) {
+                                      completedCount += 1;
+                                      continue;
+                                    }
+                                    if (
+                                      member.taskStatus === "running" ||
+                                      member.taskStatus === "awaiting_report"
+                                    ) {
+                                      runningCount += 1;
+                                      continue;
+                                    }
+                                    if (member.taskStatus === "queued") {
+                                      queuedCount += 1;
+                                      continue;
+                                    }
+                                    if (member.taskStatus === "interrupted") {
+                                      interruptedCount += 1;
+                                    }
+                                  }
+                                  const groupTitle =
+                                    allMembers[0]?.title ?? allMembers[0]?.name ?? "Task group";
+                                  const isExpanded = expandedTaskGroups[taskGroupId] ?? false;
+
+                                  renderedRows.push(
+                                    <TaskGroupListItem
+                                      key={`task-group:${taskGroupId}`}
+                                      groupId={taskGroupId}
+                                      title={groupTitle}
+                                      kind={groupKind}
+                                      depth={depth}
+                                      totalCount={totalCount}
+                                      visibleCount={sortedVisibleMembers.length}
+                                      completedCount={completedCount}
+                                      runningCount={runningCount}
+                                      queuedCount={queuedCount}
+                                      interruptedCount={interruptedCount}
+                                      isExpanded={isExpanded}
+                                      isSelected={allMembers.some(
+                                        (member) => member.id === selectedWorkspace?.workspaceId
+                                      )}
+                                      onToggle={() => {
+                                        toggleTaskGroupExpansion(taskGroupId);
+                                      }}
+                                    />
+                                  );
+
+                                  if (isExpanded) {
+                                    for (const member of sortedVisibleMembers) {
+                                      renderedRows.push(
+                                        renderWorkspace(
+                                          member,
+                                          sectionId,
+                                          null,
+                                          depth + 1,
+                                          `task-group-member:${taskGroupId}:${member.id}`
+                                        )
+                                      );
+                                    }
+                                  }
+                                }
+
+                                return renderedRows;
                               };
 
                               const renderDraft = (
@@ -1567,7 +1976,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               const renderAgeTiers = (
                                 workspaces: FrontendWorkspaceMetadata[],
                                 tierKeyPrefix: string,
-                                sectionId?: string
+                                sectionId?: string,
+                                allRowsForTaskGroupCoalescing: FrontendWorkspaceMetadata[] = workspaces
                               ): React.ReactNode => {
                                 const { recent: topVisibleRows, buckets } =
                                   partitionWorkspacesByAge(workspaces, workspaceRecency);
@@ -1772,13 +2182,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                       </button>
                                       {isTierExpanded && (
                                         <>
-                                          {bucket.map((ws) =>
-                                            renderWorkspace(
-                                              ws,
-                                              sectionId,
-                                              rowMetaByVisibleWorkspaceId.get(ws.id)
-                                            )
-                                          )}
+                                          {renderWorkspaceRowsWithTaskGroupCoalescing({
+                                            rows: bucket,
+                                            allRows: allRowsForTaskGroupCoalescing,
+                                            sectionId,
+                                            rowMetaByWorkspaceId: rowMetaByVisibleWorkspaceId,
+                                          })}
                                           {(() => {
                                             const nextTier = findNextNonEmptyTier(
                                               buckets,
@@ -1794,20 +2203,27 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
                                 return (
                                   <>
-                                    {topVisibleRows.map((ws) =>
-                                      renderWorkspace(
-                                        ws,
-                                        sectionId,
-                                        rowMetaByVisibleWorkspaceId.get(ws.id)
-                                      )
-                                    )}
+                                    {renderWorkspaceRowsWithTaskGroupCoalescing({
+                                      rows: topVisibleRows,
+                                      allRows: allRowsForTaskGroupCoalescing,
+                                      sectionId,
+                                      rowMetaByWorkspaceId: rowMetaByVisibleWorkspaceId,
+                                    })}
                                     {firstTier !== -1 && renderTier(firstTier)}
                                   </>
                                 );
                               };
 
-                              // Filter completed child rows before section partitioning so every
-                              // section view stays in sync with the same visible hierarchy.
+                              // Partition both the full section membership and the filtered visible rows.
+                              // Best-of grouping stays leaf-only by consulting the unfiltered section data,
+                              // while actual rendering still follows the visible hierarchy.
+                              const {
+                                unsectioned: allUnsectionedForNormalRendering,
+                                bySectionId: allBySectionIdForNormalRendering,
+                              } = partitionWorkspacesBySection(
+                                workspacesForNormalRendering,
+                                sections
+                              );
                               const { unsectioned, bySectionId } = partitionWorkspacesBySection(
                                 visibleWorkspacesForNormalRendering,
                                 sections
@@ -1857,6 +2273,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               // Render section with its workspaces
                               const renderSection = (section: SectionConfig) => {
                                 const sectionWorkspaces = bySectionId.get(section.id) ?? [];
+                                const sectionAllWorkspaces =
+                                  allBySectionIdForNormalRendering.get(section.id) ?? [];
                                 const sectionDrafts = draftsBySectionId.get(section.id) ?? [];
 
                                 const sectionExpandedKey = getSectionExpandedKey(
@@ -1916,7 +2334,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                                 ":tier:0",
                                                 ":tier"
                                               ),
-                                              section.id
+                                              section.id,
+                                              sectionAllWorkspaces
                                             )
                                           ) : sectionDrafts.length === 0 ? (
                                             <div className="text-muted px-3 py-2 text-center text-xs italic">
@@ -1944,7 +2363,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                       {unsectioned.length > 0 ? (
                                         renderAgeTiers(
                                           unsectioned,
-                                          getTierKey(projectPath, 0).replace(":0", "")
+                                          getTierKey(projectPath, 0).replace(":0", ""),
+                                          undefined,
+                                          allUnsectionedForNormalRendering
                                         )
                                       ) : unsectionedDrafts.length === 0 ? (
                                         <div className="text-muted px-3 py-2 text-center text-xs italic">
@@ -1958,7 +2379,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                       {unsectioned.length > 0 &&
                                         renderAgeTiers(
                                           unsectioned,
-                                          getTierKey(projectPath, 0).replace(":0", "")
+                                          getTierKey(projectPath, 0).replace(":0", ""),
+                                          undefined,
+                                          allUnsectionedForNormalRendering
                                         )}
                                     </>
                                   )}
@@ -1990,6 +2413,39 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             side="left"
             shortcut={formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)}
           />
+          <PositionedMenu
+            open={projectContextMenu.isOpen}
+            onOpenChange={handleProjectMenuOpenChange}
+            position={projectContextMenu.position}
+          >
+            <PositionedMenuItem
+              icon={<Pencil />}
+              label="Edit name"
+              disabled={!hasProjectMenuTarget}
+              onClick={() => {
+                handleProjectMenuEditName();
+              }}
+            />
+            <PositionedMenuItem
+              icon={<KeyRound />}
+              label="Manage secrets"
+              disabled={!hasProjectMenuTarget}
+              onClick={() => {
+                handleProjectMenuManageSecrets();
+              }}
+            />
+            <Separator />
+            <PositionedMenuItem
+              icon={<Trash />}
+              label="Delete..."
+              variant="destructive"
+              disabled={!hasProjectMenuTarget}
+              onClick={(event) => {
+                handleProjectMenuDelete(event.currentTarget);
+              }}
+            />
+          </PositionedMenu>
+
           <ConfirmationModal
             isOpen={archiveConfirmation !== null}
             title={

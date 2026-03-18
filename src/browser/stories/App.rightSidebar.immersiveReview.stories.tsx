@@ -8,10 +8,17 @@ import {
   getReviewImmersiveKey,
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
+import { extractAllHunks, parseDiff } from "@/common/utils/git/diffParser";
 
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mockFactory";
-import { expandRightSidebar, setupSimpleChatStory } from "./storyHelpers";
+import {
+  createReview,
+  expandRightSidebar,
+  setReadHunks,
+  setReviews,
+  setupSimpleChatStory,
+} from "./storyHelpers";
 
 const LINE_HEIGHT_DEBUG_WORKSPACE_ID = "ws-review-immersive-line-height";
 
@@ -42,6 +49,15 @@ index 1111111..2222222 100644
 `;
 
 const IMMERSIVE_LINE_HEIGHT_NUMSTAT = "7\t2\tsrc/utils/formatPrice.ts";
+
+const IMMERSIVE_REVIEW_COMPLETE_WORKSPACE_ID = "ws-review-immersive-complete";
+
+function getDiffHunkIds(diffOutput: string): string[] {
+  return extractAllHunks(parseDiff(diffOutput)).map((hunk) => hunk.id);
+}
+
+const IMMERSIVE_NOTES_PREVIEW_WORKSPACE_ID = "ws-review-immersive-notes-preview";
+const IMMERSIVE_NOTES_PREVIEW_BASE_TIME = 1700000000000;
 
 const HIGHLIGHT_VS_PLAIN_WORKSPACE_ID = "ws-review-immersive-highlight-vs-plain";
 const HIGHLIGHT_FALLBACK_THRESHOLD_BYTES = 32 * 1024;
@@ -174,6 +190,153 @@ export const ReviewTabImmersiveLineHeightDebug: AppStory = {
       },
       { timeout: 10_000 }
     );
+  },
+};
+
+export const ImmersiveReviewComplete: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("review"));
+        localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "760");
+        localStorage.setItem("review-show-read", JSON.stringify(false));
+        localStorage.removeItem(getRightSidebarLayoutKey(IMMERSIVE_REVIEW_COMPLETE_WORKSPACE_ID));
+        updatePersistedState(getReviewImmersiveKey(IMMERSIVE_REVIEW_COMPLETE_WORKSPACE_ID), true);
+        setReadHunks(
+          IMMERSIVE_REVIEW_COMPLETE_WORKSPACE_ID,
+          getDiffHunkIds(IMMERSIVE_LINE_HEIGHT_DIFF)
+        );
+
+        const client = setupSimpleChatStory({
+          workspaceId: IMMERSIVE_REVIEW_COMPLETE_WORKSPACE_ID,
+          workspaceName: "feature/immersive-review-complete",
+          projectName: "my-app",
+          messages: [
+            createUserMessage("msg-1", "Finish this immersive review walkthrough.", {
+              historySequence: 1,
+            }),
+            createAssistantMessage("msg-2", "All hunks are already reviewed.", {
+              historySequence: 2,
+            }),
+          ],
+          gitDiff: {
+            diffOutput: IMMERSIVE_LINE_HEIGHT_DIFF,
+            numstatOutput: IMMERSIVE_LINE_HEIGHT_NUMSTAT,
+          },
+        });
+
+        expandRightSidebar();
+        return client;
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    await waitFor(
+      () => {
+        canvas.getByTestId("immersive-review-complete");
+        canvas.getByRole("heading", { name: /Review complete/i });
+        canvas.getByRole("button", { name: /Return to chat/i });
+        if (canvas.queryByText(/No hunks for this file/i)) {
+          throw new Error(
+            "Expected the immersive review completion state instead of the empty-file copy."
+          );
+        }
+      },
+      { timeout: 10_000 }
+    );
+  },
+};
+
+export const ImmersiveNotesSidebarActionFooter: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("review"));
+        localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "760");
+        localStorage.removeItem(getRightSidebarLayoutKey(IMMERSIVE_NOTES_PREVIEW_WORKSPACE_ID));
+        updatePersistedState(getReviewImmersiveKey(IMMERSIVE_NOTES_PREVIEW_WORKSPACE_ID), true);
+        setReviews(IMMERSIVE_NOTES_PREVIEW_WORKSPACE_ID, [
+          createReview(
+            "review-footer-1",
+            "src/utils/formatPrice.ts",
+            "1-4",
+            "Keep the formatter instance shared so the fallback and regular output stay aligned when the currency changes.",
+            "pending",
+            IMMERSIVE_NOTES_PREVIEW_BASE_TIME + 1
+          ),
+          createReview(
+            "review-footer-2",
+            "src/utils/formatPrice.ts",
+            "6-8",
+            "The shorter note makes it easier to compare where each card footer lands.",
+            "checked",
+            IMMERSIVE_NOTES_PREVIEW_BASE_TIME + 2
+          ),
+        ]);
+
+        const client = setupSimpleChatStory({
+          workspaceId: IMMERSIVE_NOTES_PREVIEW_WORKSPACE_ID,
+          workspaceName: "feature/immersive-note-preview-footer",
+          projectName: "my-app",
+          messages: [
+            createUserMessage("msg-1", "Please review this pricing formatter update.", {
+              historySequence: 1,
+            }),
+            createAssistantMessage(
+              "msg-2",
+              "I opened immersive review with a couple of sidebar notes.",
+              {
+                historySequence: 2,
+              }
+            ),
+          ],
+          gitDiff: {
+            diffOutput: IMMERSIVE_LINE_HEIGHT_DIFF,
+            numstatOutput: IMMERSIVE_LINE_HEIGHT_NUMSTAT,
+          },
+        });
+
+        expandRightSidebar();
+        return client;
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    await waitFor(
+      () => {
+        canvas.getByTestId("immersive-review-view");
+        canvas.getByText(/Keep the formatter instance shared/i);
+      },
+      { timeout: 10_000 }
+    );
+
+    const noteCard = canvasElement.querySelector<HTMLElement>('[data-note-index="0"]');
+    if (!noteCard) {
+      throw new Error("Expected the first immersive review note card to render.");
+    }
+
+    // Focus the first card so Storybook captures the reserved footer state that prevents
+    // the note preview layout from shifting when review actions appear. Focus is more
+    // deterministic than hover in the CI interaction runner while exercising the same UI.
+    noteCard.focus();
+
+    await waitFor(() => {
+      const deleteButton = noteCard.querySelector<HTMLButtonElement>(
+        'button[aria-label="Delete review note"]'
+      );
+      if (!deleteButton) {
+        throw new Error("Expected the focused note card to include a delete action.");
+      }
+
+      const computedStyle = window.getComputedStyle(deleteButton);
+      if (computedStyle.visibility !== "visible" || computedStyle.opacity !== "1") {
+        throw new Error("Expected the note footer action to be visible after focusing the card.");
+      }
+    });
   },
 };
 

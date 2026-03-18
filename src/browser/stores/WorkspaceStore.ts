@@ -17,6 +17,11 @@ import {
   type LoadedSkill,
   type SkillLoadError,
 } from "@/browser/utils/messages/StreamingMessageAggregator";
+import {
+  createIdleCompactionCompletion,
+  type ResponseCompleteEvent,
+  type ResponseCompleteHandler,
+} from "@/browser/utils/messages/responseCompletionMetadata";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { BASH_TRUNCATE_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -31,11 +36,11 @@ import {
   isQueuedMessageChanged,
   isRestoreToInput,
 } from "@/common/orpc/types";
-import type {
-  StreamAbortEvent,
-  StreamAbortReasonSnapshot,
-  StreamEndEvent,
-  RuntimeStatusEvent,
+import {
+  type StreamAbortEvent,
+  type StreamAbortReasonSnapshot,
+  type StreamEndEvent,
+  type RuntimeStatusEvent,
 } from "@/common/types/stream";
 import { MapStore } from "./MapStore";
 import { createDisplayUsage, recomputeUsageCosts } from "@/common/utils/tokens/displayUsage";
@@ -178,7 +183,7 @@ interface WorkspaceChatTransientState {
   replayingHistory: boolean;
   queuedMessage: QueuedMessage | null;
   liveBashOutput: Map<string, LiveBashOutputInternal>;
-  liveTaskIds: Map<string, string>;
+  liveTaskIds: Map<string, string[]>;
   autoRetryStatus: AutoRetryStatus | null;
 }
 
@@ -528,20 +533,8 @@ export class WorkspaceStore {
   // Global callback for navigating to a workspace (set by App, used for notification clicks)
   private navigateToWorkspaceCallback: ((workspaceId: string) => void) | null = null;
 
-  // Global callback when a response completes (for "notify on response" feature)
-  // isFinal is true when no more active streams remain (assistant done with all work)
-  // finalText is the text content after any tool calls (for notification body)
-  // compaction is provided when this was a compaction stream (includes continue metadata)
-  private responseCompleteCallback:
-    | ((
-        workspaceId: string,
-        messageId: string,
-        isFinal: boolean,
-        finalText: string,
-        compaction?: { hasContinueMessage: boolean; isIdle?: boolean },
-        completedAt?: number | null
-      ) => void)
-    | null = null;
+  // Global callback when a response completes (for "notify on response" feature).
+  private responseCompleteCallback: ResponseCompleteHandler | null = null;
 
   // Tracks when a file-modifying tool (file_edit_*, bash) last completed per workspace.
   // ReviewPanel subscribes to trigger diff refresh. Two structures:
@@ -584,6 +577,10 @@ export class WorkspaceStore {
       this.states.bump(workspaceId);
       // Bump usage store so liveUsage is recomputed with new activeStreamId
       this.usageStore.bump(workspaceId);
+    },
+    "stream-lifecycle": (workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+      this.states.bump(workspaceId);
     },
     "stream-delta": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -816,10 +813,9 @@ export class WorkspaceStore {
           }
         : null;
 
-      // Mirror the queue signal onto the active compaction stream so background
-      // activity-stop notifications can still suppress the intermediate
-      // "Compaction complete" notice after we unsubscribe from onChat.
-      aggregator.setActiveCompactionQueuedFollowUp(queuedMessage !== null);
+      // Mirror the queue signal onto active streams so response notifications follow
+      // user-visible terminal turns instead of every intermediate handoff.
+      aggregator.setActiveQueuedFollowUp(queuedMessage !== null);
       this.assertChatTransientState(workspaceId).queuedMessage = queuedMessage;
       this.states.bump(workspaceId);
     },
@@ -1226,95 +1222,18 @@ export class WorkspaceStore {
 
   /**
    * Set the callback for when a response completes (used for "notify on response" feature).
-   * isFinal is true when no more active streams remain (assistant done with all work).
-   * finalText is the text content after any tool calls (for notification body).
-   * compaction is provided when this was a compaction stream (includes continue metadata).
    */
-  setOnResponseComplete(
-    callback: (
-      workspaceId: string,
-      messageId: string,
-      isFinal: boolean,
-      finalText: string,
-      compaction?: { hasContinueMessage: boolean; isIdle?: boolean },
-      completedAt?: number | null
-    ) => void
-  ): void {
+  setOnResponseComplete(callback: ResponseCompleteHandler): void {
     this.responseCompleteCallback = callback;
-    // Update existing aggregators with the callback
-    for (const aggregator of this.aggregators.values()) {
-      this.bindAggregatorResponseCompleteCallback(aggregator);
-    }
   }
 
-  private maybeMarkCompactionContinueFromQueuedFollowUp(
-    workspaceId: string,
-    compaction: { hasContinueMessage: boolean; isIdle?: boolean } | undefined,
-    includeQueuedFollowUpSignal: boolean
-  ): { hasContinueMessage: boolean; isIdle?: boolean } | undefined {
-    if (!compaction || compaction.hasContinueMessage || !includeQueuedFollowUpSignal) {
-      return compaction;
-    }
-
-    const queuedMessage = this.chatTransientState.get(workspaceId)?.queuedMessage;
-    if (!queuedMessage) {
-      return compaction;
-    }
-
-    // A queued message will be auto-sent after stream-end. Suppress the intermediate
-    // "Compaction complete" notification and only notify for the follow-up response.
-    return {
-      ...compaction,
-      hasContinueMessage: true,
-    };
+  private emitResponseComplete(event: ResponseCompleteEvent): void {
+    this.responseCompleteCallback?.(event);
   }
 
-  private emitResponseComplete(
-    workspaceId: string,
-    messageId: string,
-    isFinal: boolean,
-    finalText: string,
-    compaction?: { hasContinueMessage: boolean; isIdle?: boolean },
-    completedAt?: number | null,
-    includeQueuedFollowUpSignal = true
-  ): void {
-    if (!this.responseCompleteCallback) {
-      return;
-    }
-
-    this.responseCompleteCallback(
-      workspaceId,
-      messageId,
-      isFinal,
-      finalText,
-      this.maybeMarkCompactionContinueFromQueuedFollowUp(
-        workspaceId,
-        compaction,
-        includeQueuedFollowUpSignal
-      ),
-      completedAt
-    );
-  }
-
-  private bindAggregatorResponseCompleteCallback(aggregator: StreamingMessageAggregator): void {
-    aggregator.onResponseComplete = (
-      workspaceId: string,
-      messageId: string,
-      isFinal: boolean,
-      finalText: string,
-      compaction?: { hasContinueMessage: boolean; isIdle?: boolean },
-      completedAt?: number | null
-    ) => {
-      this.emitResponseComplete(
-        workspaceId,
-        messageId,
-        isFinal,
-        finalText,
-        compaction,
-        completedAt
-      );
-    };
-  }
+  private readonly forwardResponseComplete = (event: ResponseCompleteEvent): void => {
+    this.emitResponseComplete(event);
+  };
 
   /**
    * Schedule a state bump during browser idle time.
@@ -1523,9 +1442,9 @@ export class WorkspaceStore {
     return state ?? null;
   }
 
-  getTaskToolLiveTaskId(workspaceId: string, toolCallId: string): string | null {
-    const taskId = this.chatTransientState.get(workspaceId)?.liveTaskIds.get(toolCallId);
-    return taskId ?? null;
+  getTaskToolLiveTaskIds(workspaceId: string, toolCallId: string): string[] | null {
+    const taskIds = this.chatTransientState.get(workspaceId)?.liveTaskIds.get(toolCallId);
+    return taskIds ?? null;
   }
 
   /**
@@ -1608,6 +1527,7 @@ export class WorkspaceStore {
       const messages = aggregator.getAllMessages();
       const metadata = this.workspaceMetadata.get(workspaceId);
       const pendingStreamStartTime = aggregator.getPendingStreamStartTime();
+      const streamLifecycle = aggregator.getStreamLifecycle();
       // Trust the live aggregator only when it is both active AND has finished
       // replaying historical events (caughtUp). During the replay window after a
       // workspace switch, the aggregator is cleared and re-hydrating; fall back to
@@ -1628,12 +1548,22 @@ export class WorkspaceStore {
       const currentThinkingLevel = useAggregatorState
         ? (aggregator.getCurrentThinkingLevel() ?? null)
         : (activity?.lastThinkingLevel ?? aggregator.getCurrentThinkingLevel() ?? null);
+      const hasAuthoritativeStreamLifecycle =
+        streamLifecycle !== null && streamLifecycle.phase !== "idle";
       const aggregatorRecency = aggregator.getRecencyTimestamp();
       const recencyTimestamp =
         aggregatorRecency === null
           ? (activity?.recency ?? null)
           : Math.max(aggregatorRecency, activity?.recency ?? aggregatorRecency);
-      const isStreamStarting = pendingStreamStartTime !== null && !canInterrupt;
+      // Treat the backend lifecycle as authoritative, but keep any optimistic
+      // pre-stream "starting" state scoped to the active, caught-up workspace.
+      // Inactive or replaying workspaces should derive status from authoritative
+      // activity instead of a sticky local pending-start timestamp.
+      const isStreamStarting =
+        useAggregatorState &&
+        (streamLifecycle?.phase === "preparing" ||
+          (!hasAuthoritativeStreamLifecycle && pendingStreamStartTime !== null)) &&
+        !canInterrupt;
       const isHydratingTranscript =
         isActiveWorkspace && transient.isHydratingTranscript && !transient.caughtUp;
       const agentStatus = useAggregatorState
@@ -1697,7 +1627,7 @@ export class WorkspaceStore {
    */
   getWorkspaceSidebarState(workspaceId: string): WorkspaceSidebarState {
     const fullState = this.getWorkspaceState(workspaceId);
-    const isStarting = fullState.pendingStreamStartTime !== null && !fullState.canInterrupt;
+    const isStarting = fullState.isStreamStarting;
     const terminalActivity = this.workspaceTerminalActivity.get(workspaceId);
     const terminalActiveCount = terminalActivity?.activeCount ?? 0;
     const terminalSessionCount = terminalActivity?.totalSessions ?? 0;
@@ -2327,30 +2257,6 @@ export class WorkspaceStore {
     return this.workspaceMetadata.has(workspaceId);
   }
 
-  private getBackgroundCompletionCompaction(
-    workspaceId: string
-  ): { hasContinueMessage: boolean } | undefined {
-    const aggregator = this.aggregators.get(workspaceId);
-    if (!aggregator) {
-      return undefined;
-    }
-
-    const compactingStreams = aggregator
-      .getActiveStreams()
-      .filter((stream) => stream.isCompacting === true);
-
-    if (compactingStreams.length === 0) {
-      return undefined;
-    }
-
-    return {
-      hasContinueMessage: compactingStreams.some(
-        (stream) =>
-          stream.hasCompactionContinue === true || stream.hasQueuedCompactionFollowUp === true
-      ),
-    };
-  }
-
   private applyWorkspaceActivitySnapshot(
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot | null
@@ -2365,6 +2271,7 @@ export class WorkspaceStore {
 
     const changed =
       previous?.streaming !== snapshot?.streaming ||
+      previous?.streamingGeneration !== snapshot?.streamingGeneration ||
       previous?.lastModel !== snapshot?.lastModel ||
       previous?.lastThinkingLevel !== snapshot?.lastThinkingLevel ||
       previous?.recency !== snapshot?.recency ||
@@ -2384,6 +2291,20 @@ export class WorkspaceStore {
       this.activityStreamingStartRecency.set(workspaceId, startedStreamingSnapshot.recency);
     }
 
+    const didBackgroundStreamingGenerationAdvance =
+      workspaceId !== this.activeWorkspaceId &&
+      previous?.streaming === true &&
+      snapshot?.streaming === true &&
+      previous.streamingGeneration !== undefined &&
+      snapshot.streamingGeneration !== undefined &&
+      previous.streamingGeneration !== snapshot.streamingGeneration;
+    if (didBackgroundStreamingGenerationAdvance) {
+      // Background activity snapshots continue across handoffs even after onChat unsubscribes.
+      // Once a newer stream generation appears, any cached live stream contexts are stale and
+      // must not suppress the terminal notification for the new background turn.
+      this.aggregators.get(workspaceId)?.clearActiveStreams();
+    }
+
     const stoppedStreamingSnapshot =
       previous?.streaming === true && snapshot?.streaming === false ? snapshot : null;
     // Activity snapshots only collapse for background workspaces — active workspaces
@@ -2399,8 +2320,8 @@ export class WorkspaceStore {
       stoppedStreamingSnapshot !== null &&
       streamStartRecency !== undefined &&
       stoppedStreamingSnapshot.recency > streamStartRecency;
-    const backgroundCompaction = isBackgroundStreamingStop
-      ? this.getBackgroundCompletionCompaction(workspaceId)
+    const backgroundCompletion = isBackgroundStreamingStop
+      ? this.aggregators.get(workspaceId)?.getActiveResponseCompleteMetadata()
       : undefined;
     // The backend tags the streaming=false (stop) snapshot with isIdleCompaction.
     // The idle marker is added after sendMessage returns (to avoid races with
@@ -2416,21 +2337,15 @@ export class WorkspaceStore {
     if (stoppedStreamingSnapshot && recencyAdvancedSinceStreamStart && isBackgroundStreamingStop) {
       // Activity snapshots don't include message/content metadata. Reuse any
       // still-active stream context captured before this workspace was backgrounded
-      // so compaction continue turns remain suppressible in App notifications.
-      this.emitResponseComplete(
+      // so queued follow-up handoffs remain suppressible in App notifications.
+      this.emitResponseComplete({
         workspaceId,
-        "",
-        true,
-        "",
-        wasIdleCompaction
-          ? {
-              hasContinueMessage: backgroundCompaction?.hasContinueMessage ?? false,
-              isIdle: true,
-            }
-          : backgroundCompaction,
-        stoppedStreamingSnapshot.recency,
-        false
-      );
+        isFinal: true,
+        completion: wasIdleCompaction
+          ? createIdleCompactionCompletion(backgroundCompletion?.hasAutoFollowUp ?? false)
+          : backgroundCompletion,
+        completedAt: stoppedStreamingSnapshot.recency,
+      });
     }
 
     if (isBackgroundStreamingStop) {
@@ -2438,6 +2353,7 @@ export class WorkspaceStore {
       // activity confirms streaming stopped, clear stale stream contexts so they
       // cannot leak compaction metadata into future completion callbacks.
       this.aggregators.get(workspaceId)?.clearActiveStreams();
+      this.aggregators.get(workspaceId)?.clearPendingStreamStart();
     }
 
     if (snapshot?.streaming !== true) {
@@ -3458,10 +3374,8 @@ export class WorkspaceStore {
       if (this.navigateToWorkspaceCallback) {
         aggregator.onNavigateToWorkspace = this.navigateToWorkspaceCallback;
       }
-      // Wire up response complete callback for "notify on response" feature
-      if (this.responseCompleteCallback) {
-        this.bindAggregatorResponseCompleteCallback(aggregator);
-      }
+      // Wire up response-complete forwarding for the "notify on response" feature.
+      aggregator.onResponseComplete = this.forwardResponseComplete;
       this.aggregators.set(workspaceId, aggregator);
       this.workspaceCreatedAt.set(workspaceId, createdAt);
     } else if (unarchivedAt) {
@@ -3531,6 +3445,11 @@ export class WorkspaceStore {
       ) {
         aggregator.clearActiveStreams();
       }
+      // When server confirms no active stream, clear optimistic pending-start state
+      // so the UI doesn't remain stuck in "starting..." after reconnect.
+      if (serverActiveStreamMessageId === undefined) {
+        aggregator.clearPendingStreamStart();
+      }
 
       if (replay === "full") {
         // Full replay replaces backend-derived history state. Reset transient UI-only
@@ -3576,7 +3495,7 @@ export class WorkspaceStore {
       }
       pendingEvents.length = 0;
 
-      // Done replaying buffered events
+      // Done replaying buffered events.
       transient.replayingHistory = false;
 
       if (replay === "since" && data.hasOlderHistory === undefined) {
@@ -3630,7 +3549,22 @@ export class WorkspaceStore {
     //
     // This is especially important for workspaces with long histories (100+ messages),
     // where unbuffered rendering would cause visible lag and UI stutter.
+    if (!transient.caughtUp && isStreamError(data) && data.replay === true) {
+      // Show replayed terminal errors immediately so reconnect UIs preserve the same
+      // failure classification/copy as the live session, then replay them again after
+      // history loads so full-replay replacement does not wipe the error back out.
+      applyWorkspaceChatEventToAggregator(aggregator, data, { allowSideEffects: false });
+      this.states.bump(workspaceId);
+      transient.pendingStreamEvents.push(data);
+      return;
+    }
+
     if (!transient.caughtUp && this.isBufferedEvent(data)) {
+      if ("type" in data && (data.type === "stream-lifecycle" || data.type === "stream-abort")) {
+        applyWorkspaceChatEventToAggregator(aggregator, data, { allowSideEffects: false });
+        this.states.bump(workspaceId);
+      }
+
       transient.pendingStreamEvents.push(data);
       return;
     }
@@ -3697,11 +3631,10 @@ export class WorkspaceStore {
     if (isTaskCreatedEvent(data)) {
       const transient = this.assertChatTransientState(workspaceId);
 
-      // Avoid unnecessary re-renders if the taskId is unchanged.
-      const prev = transient.liveTaskIds.get(data.toolCallId);
-      if (prev === data.taskId) return;
+      const prev = transient.liveTaskIds.get(data.toolCallId) ?? [];
+      if (prev.includes(data.taskId)) return;
 
-      transient.liveTaskIds.set(data.toolCallId, data.taskId);
+      transient.liveTaskIds.set(data.toolCallId, [...prev, data.taskId]);
 
       // Low-frequency: bump immediately so the user can open the child workspace quickly.
       this.states.bump(workspaceId);
@@ -3886,10 +3819,10 @@ export function useBashToolLiveOutput(
  * This exists because foreground tasks (run_in_background=false) won't return a tool result
  * until the child workspace finishes, but we still want to expose the spawned taskId ASAP.
  */
-export function useTaskToolLiveTaskId(
+export function useTaskToolLiveTaskIds(
   workspaceId: string | undefined,
   toolCallId: string | undefined
-): string | null {
+): string[] | null {
   const store = getStoreInstance();
 
   return useSyncExternalStore(
@@ -3899,7 +3832,7 @@ export function useTaskToolLiveTaskId(
     },
     () => {
       if (!workspaceId || !toolCallId) return null;
-      return store.getTaskToolLiveTaskId(workspaceId, toolCallId);
+      return store.getTaskToolLiveTaskIds(workspaceId, toolCallId);
     }
   );
 }

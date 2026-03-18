@@ -1316,6 +1316,131 @@ describe("StreamManager - Unavailable Tool Handling", () => {
   });
 });
 
+describe("StreamManager - empty stream completions", () => {
+  const runtime = createRuntime({ type: "local", srcBaseDir: "/tmp" });
+
+  test("retries one empty stream internally before persisting a retryable empty-output error", async () => {
+    const streamManager = new StreamManager(historyService);
+    const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
+    const streamEndEvents: unknown[] = [];
+
+    streamManager.on("error", (data) => {
+      errorEvents.push(data as { messageId: string; error: string; errorType?: string });
+    });
+    streamManager.on("stream-end", (data) => {
+      streamEndEvents.push(data);
+    });
+
+    const replaceTokenTrackerResult = Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    expect(replaceTokenTrackerResult).toBe(true);
+
+    const workspaceId = "empty-output-workspace";
+    const messageId = "empty-output-message";
+    const historySequence = 1;
+
+    const appendResult = await historyService.appendToHistory(workspaceId, {
+      id: messageId,
+      role: "assistant",
+      metadata: {
+        historySequence,
+        partial: true,
+      },
+      parts: [],
+    });
+    expect(appendResult.success).toBe(true);
+    if (!appendResult.success) {
+      throw new Error(appendResult.error);
+    }
+
+    const processStreamWithCleanup = Reflect.get(streamManager, "processStreamWithCleanup") as (
+      workspaceId: string,
+      streamInfo: unknown,
+      historySequence: number
+    ) => Promise<void>;
+    expect(typeof processStreamWithCleanup).toBe("function");
+
+    const createStreamResult = mock(() => ({
+      fullStream: (async function* () {
+        // Retry path also returns no output so the empty-output error still surfaces.
+      })(),
+      totalUsage: Promise.resolve({ inputTokens: 3, outputTokens: 0, totalTokens: 3 }),
+      usage: Promise.resolve({ inputTokens: 3, outputTokens: 0, totalTokens: 3 }),
+      providerMetadata: Promise.resolve(undefined),
+      steps: Promise.resolve([]),
+    }));
+    const replaceCreateStreamResult = Reflect.set(
+      streamManager,
+      "createStreamResult",
+      createStreamResult
+    );
+    expect(replaceCreateStreamResult).toBe(true);
+
+    const streamInfo = {
+      state: "streaming",
+      streamResult: {
+        fullStream: (async function* () {
+          // No-op stream: this reproduces the silent placeholder case we saw in debug logs.
+        })(),
+        totalUsage: Promise.resolve({ inputTokens: 3, outputTokens: 0, totalTokens: 3 }),
+        usage: Promise.resolve({ inputTokens: 3, outputTokens: 0, totalTokens: 3 }),
+        providerMetadata: Promise.resolve(undefined),
+        steps: Promise.resolve([]),
+      },
+      abortController: new AbortController(),
+      messageId,
+      token: "test-token",
+      startTime: Date.now() - 250,
+      lastPartTimestamp: Date.now() - 250,
+      toolCompletionTimestamps: new Map<string, number>(),
+      model: KNOWN_MODELS.SONNET.id,
+      metadataModel: KNOWN_MODELS.SONNET.id,
+      historySequence,
+      initialMetadata: { agentId: "plan" },
+      request: { model: "ignored-model", messages: [], providerOptions: undefined },
+      stepTracker: {},
+      didRetryPreviousResponseIdAtStep: false,
+      currentStepStartIndex: 0,
+      parts: [],
+      lastPartialWriteTime: 0,
+      partialWriteTimer: undefined,
+      partialWritePromise: undefined,
+      processingPromise: Promise.resolve(),
+      softInterrupt: { pending: false as const },
+      runtimeTempDir: "",
+      runtime,
+      cumulativeUsage: { inputTokens: 7, outputTokens: 0, totalTokens: 7 },
+      cumulativeProviderMetadata: { openai: { cached_tokens: 2 } },
+      lastStepUsage: { inputTokens: 7, outputTokens: 0, totalTokens: 7 },
+      lastStepProviderMetadata: { openai: { cached_tokens: 2 } },
+    };
+
+    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+
+    expect(createStreamResult).toHaveBeenCalledTimes(1);
+    expect(streamEndEvents).toHaveLength(0);
+    expect(errorEvents).toHaveLength(1);
+    expect(errorEvents[0]).toMatchObject({
+      messageId,
+      errorType: "empty_output",
+    });
+    expect(errorEvents[0]?.error).toContain("before producing any assistant-visible output");
+
+    expect(streamInfo.cumulativeUsage).toEqual({ inputTokens: 7, outputTokens: 0, totalTokens: 7 });
+    expect(streamInfo.lastStepUsage).toEqual({ inputTokens: 7, outputTokens: 0, totalTokens: 7 });
+    expect(streamInfo.cumulativeProviderMetadata).toEqual({ openai: { cached_tokens: 2 } });
+    expect(streamInfo.lastStepProviderMetadata).toEqual({ openai: { cached_tokens: 2 } });
+
+    const partial = await historyService.readPartial(workspaceId);
+    expect(partial?.metadata?.errorType).toBe("empty_output");
+    expect(partial?.metadata?.error).toContain("before producing any assistant-visible output");
+    expect(partial?.metadata?.metadataModel).toBe(KNOWN_MODELS.SONNET.id);
+    expect(partial?.parts).toEqual([]);
+  });
+});
+
 describe("StreamManager - TTFT metadata persistence", () => {
   const runtime = createRuntime({ type: "local", srcBaseDir: "/tmp" });
 
@@ -1335,6 +1460,8 @@ describe("StreamManager - TTFT metadata persistence", () => {
       totalTokens: number;
       reasoningTokens?: number;
     };
+    model?: string;
+    metadataModel?: string;
   }) {
     const streamManager = new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests
@@ -1395,7 +1522,8 @@ describe("StreamManager - TTFT metadata persistence", () => {
       startTime: params.startTime,
       lastPartTimestamp: params.startTime,
       toolCompletionTimestamps: new Map<string, number>(),
-      model: KNOWN_MODELS.SONNET.id,
+      model: params.model ?? KNOWN_MODELS.SONNET.id,
+      metadataModel: params.metadataModel ?? params.model ?? KNOWN_MODELS.SONNET.id,
       historySequence: params.historySequence,
       initialMetadata: params.initialMetadata,
       parts: params.parts,
@@ -1488,6 +1616,27 @@ describe("StreamManager - TTFT metadata persistence", () => {
     expect(Object.prototype.hasOwnProperty.call(updatedMessage.metadata ?? {}, "ttftMs")).toBe(
       false
     );
+  });
+
+  test("persists metadataModel alongside the raw model for analytics pricing", async () => {
+    const updatedMessage = await finalizeStreamAndReadMessage({
+      workspaceId: "metadata-model-workspace",
+      messageId: "metadata-model-message",
+      historySequence: 1,
+      startTime: Date.now() - 1000,
+      model: "openai:my-gpt4",
+      metadataModel: "openai:gpt-4",
+      parts: [
+        {
+          type: "text",
+          text: "hello",
+          timestamp: Date.now(),
+        },
+      ],
+    });
+
+    expect(updatedMessage.metadata?.model).toBe("openai:my-gpt4");
+    expect(updatedMessage.metadata?.metadataModel).toBe("openai:gpt-4");
   });
 
   test("emits and persists routeProvider from initial stream metadata", async () => {
@@ -1816,6 +1965,27 @@ describe("StreamManager - previousResponseId recovery", () => {
     const result = resolveMethod.call(
       streamManager,
       { didRetryPreviousResponseIdAtStep: true, cumulativeUsage },
+      totalUsage
+    );
+
+    expect(result).toEqual(cumulativeUsage);
+  });
+
+  test("resolveTotalUsageForStreamEnd prefers cumulative usage after empty-output retry", () => {
+    const streamManager = new StreamManager(historyService);
+
+    const resolveMethod = Reflect.get(streamManager, "resolveTotalUsageForStreamEnd") as (
+      streamInfo: unknown,
+      totalUsage: unknown
+    ) => unknown;
+    expect(typeof resolveMethod).toBe("function");
+
+    const cumulativeUsage = { inputTokens: 6, outputTokens: 5, totalTokens: 11 };
+    const totalUsage = { inputTokens: 2, outputTokens: 2, totalTokens: 4 };
+
+    const result = resolveMethod.call(
+      streamManager,
+      { didRetryPreviousResponseIdAtStep: false, didRetryAfterEmptyOutput: true, cumulativeUsage },
       totalUsage
     );
 

@@ -395,10 +395,13 @@ export interface MuxMetadata {
   historySequence?: number; // Assigned by backend for global message ordering (required when writing to history)
   duration?: number;
   ttftMs?: number; // Time-to-first-token measured from stream start; omitted when unavailable
+  finishReason?: string; // Provider/model finish reason for the final step (e.g. stop, length)
   /** @deprecated Legacy base mode derived from agent definition. */
   mode?: AgentMode;
   timestamp?: number;
   model?: string;
+  /** Resolved pricing model for token/cost metadata lookups when the selected model uses Treat as mapping. */
+  metadataModel?: string;
   /** Effective thinking/reasoning level used for this response (after model policy clamping). */
   thinkingLevel?: ThinkingLevel;
   /** @deprecated Legacy gateway flag; prefer routeProvider for source attribution. */

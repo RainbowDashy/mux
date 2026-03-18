@@ -11,11 +11,9 @@ import { AIService, resolveMuxProjectRootForHostFs } from "./aiService";
 import { discoverAvailableSubagentsForToolContext } from "./streamContextBuilder";
 import {
   normalizeAnthropicBaseURL,
-  buildAnthropicHeaders,
   buildAppAttributionHeaders,
   type ProviderModelFactory,
 } from "./providerModelFactory";
-import { ANTHROPIC_1M_CONTEXT_HEADER } from "@/common/utils/ai/providerOptions";
 import { HistoryService } from "./historyService";
 import { InitStateManager } from "./initStateManager";
 import { ProviderService } from "./providerService";
@@ -38,6 +36,7 @@ import type { LanguageModel, Tool } from "ai";
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxMessage } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import { uniqueSuffix } from "@/common/utils/hasher";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import type { StreamManager } from "./streamManager";
@@ -1444,7 +1443,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     const openaiOptions = openAIOptionsFromStartStreamCall(startStreamCall);
     expect(openaiOptions.previousResponseId).toBeUndefined();
-    expect(openaiOptions.promptCacheKey).toBe(`mux-v1-${workspaceId}`);
+    expect(openaiOptions.promptCacheKey).toBe(
+      `mux-v1-project-under-test-${uniqueSuffix([projectPath])}`
+    );
   });
 
   it("passes the resolved routeProvider into initial stream metadata", async () => {
@@ -1661,7 +1662,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     const openaiOptions = openAIOptionsFromStartStreamCall(startStreamCall);
     expect(openaiOptions.previousResponseId).toBeUndefined();
-    expect(openaiOptions.promptCacheKey).toBe(`mux-v1-${workspaceId}`);
+    expect(openaiOptions.promptCacheKey).toBe(
+      `mux-v1-project-under-test-${uniqueSuffix([projectPath])}`
+    );
   });
 });
 
@@ -2768,42 +2771,6 @@ describe("normalizeAnthropicBaseURL", () => {
   });
 });
 
-describe("buildAnthropicHeaders", () => {
-  it("returns undefined when use1MContext is false and no existing headers", () => {
-    expect(buildAnthropicHeaders(undefined, false)).toBeUndefined();
-  });
-
-  it("returns existing headers unchanged when use1MContext is false", () => {
-    const existing = { "x-custom": "value" };
-    expect(buildAnthropicHeaders(existing, false)).toBe(existing);
-  });
-
-  it("returns existing headers unchanged when use1MContext is undefined", () => {
-    const existing = { "x-custom": "value" };
-    expect(buildAnthropicHeaders(existing, undefined)).toBe(existing);
-  });
-
-  it("adds 1M context header when use1MContext is true and no existing headers", () => {
-    const result = buildAnthropicHeaders(undefined, true);
-    expect(result).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
-  });
-
-  it("merges 1M context header with existing headers when use1MContext is true", () => {
-    const existing = { "x-custom": "value" };
-    const result = buildAnthropicHeaders(existing, true);
-    expect(result).toEqual({
-      "x-custom": "value",
-      "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER,
-    });
-  });
-
-  it("overwrites existing anthropic-beta header when use1MContext is true", () => {
-    const existing = { "anthropic-beta": "other-beta" };
-    const result = buildAnthropicHeaders(existing, true);
-    expect(result).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
-  });
-});
-
 describe("buildAppAttributionHeaders", () => {
   it("adds both headers when no headers exist", () => {
     expect(buildAppAttributionHeaders(undefined)).toEqual({
@@ -2891,5 +2858,95 @@ describe("discoverAvailableSubagentsForToolContext", () => {
       expect(description).toContain("Available sub-agents");
       expect(description).toContain("- custom");
     }
+  });
+
+  it("filters desktop-only agents with a single capability probe", async () => {
+    using project = new DisposableTempDir("available-subagents-desktop");
+    using muxHome = new DisposableTempDir("available-subagents-desktop-home");
+
+    const agentsRoot = path.join(project.path, ".mux", "agents");
+    await fs.mkdir(agentsRoot, { recursive: true });
+
+    await fs.writeFile(
+      path.join(agentsRoot, "desktop-one.md"),
+      `---\nname: Desktop One\nbase: exec\nui:\n  requires:\n    - desktop\n---\nBody\n`,
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(agentsRoot, "desktop-two.md"),
+      `---\nname: Desktop Two\nbase: exec\nui:\n  requires:\n    - desktop\n---\nBody\n`,
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(agentsRoot, "plain.md"),
+      `---\nname: Plain Agent\nbase: exec\n---\nBody\n`,
+      "utf-8"
+    );
+
+    const runtime = new LocalRuntime(project.path);
+    const cfg = new Config(muxHome.path).loadConfigOrDefault();
+    const loadDesktopCapability = mock(() =>
+      Promise.resolve({
+        available: false as const,
+        reason: "unsupported_runtime" as const,
+      })
+    );
+
+    const availableSubagents = await discoverAvailableSubagentsForToolContext({
+      runtime,
+      workspacePath: project.path,
+      cfg,
+      roots: {
+        projectRoot: agentsRoot,
+        globalRoot: path.join(project.path, "empty-global-agents"),
+      },
+      loadDesktopCapability,
+    });
+
+    expect(loadDesktopCapability).toHaveBeenCalledTimes(1);
+    expect(availableSubagents.find((agent) => agent.id === "desktop-one")).toBeUndefined();
+    expect(availableSubagents.find((agent) => agent.id === "desktop-two")).toBeUndefined();
+    expect(availableSubagents.find((agent) => agent.id === "plain")?.subagentRunnable).toBe(true);
+  });
+
+  it("keeps desktop-only agents when desktop capability is available", async () => {
+    using project = new DisposableTempDir("available-subagents-desktop-enabled");
+    using muxHome = new DisposableTempDir("available-subagents-desktop-enabled-home");
+
+    const agentsRoot = path.join(project.path, ".mux", "agents");
+    await fs.mkdir(agentsRoot, { recursive: true });
+
+    await fs.writeFile(
+      path.join(agentsRoot, "desktop-enabled.md"),
+      `---\nname: Desktop Enabled\nbase: exec\nui:\n  requires:\n    - desktop\n---\nBody\n`,
+      "utf-8"
+    );
+
+    const runtime = new LocalRuntime(project.path);
+    const cfg = new Config(muxHome.path).loadConfigOrDefault();
+    const loadDesktopCapability = mock(() =>
+      Promise.resolve({
+        available: true as const,
+        width: 1440,
+        height: 900,
+        sessionId: "desktop:test-workspace",
+      })
+    );
+
+    const availableSubagents = await discoverAvailableSubagentsForToolContext({
+      runtime,
+      workspacePath: project.path,
+      cfg,
+      roots: {
+        projectRoot: agentsRoot,
+        globalRoot: path.join(project.path, "empty-global-agents"),
+      },
+      loadDesktopCapability,
+    });
+
+    expect(loadDesktopCapability).toHaveBeenCalledTimes(1);
+    expect(
+      availableSubagents.find((agent) => agent.id === "desktop-enabled")?.subagentRunnable
+    ).toBe(true);
   });
 });

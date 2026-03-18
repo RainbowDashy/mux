@@ -2,7 +2,7 @@ import "../../../../tests/ui/dom";
 
 import { type PropsWithChildren } from "react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import * as ReactDndModule from "react-dnd";
 import * as ReactDndHtml5BackendModule from "react-dnd-html5-backend";
 import * as MuxLogoDarkModule from "@/browser/assets/logos/mux-logo-dark.svg?react";
@@ -38,6 +38,7 @@ import * as WorkspaceDragLayerModule from "../WorkspaceDragLayer/WorkspaceDragLa
 import * as SectionDragLayerModule from "../SectionDragLayer/SectionDragLayer";
 import * as DraggableSectionModule from "../DraggableSection/DraggableSection";
 import * as AgentListItemModule from "../AgentListItem/AgentListItem";
+import * as PositionedMenuModule from "../PositionedMenu/PositionedMenu";
 
 import ProjectSidebar from "./ProjectSidebar";
 
@@ -61,6 +62,52 @@ interface MockAgentListItemProps {
   completedChildrenExpanded?: boolean;
   onToggleCompletedChildren?: (workspaceId: string) => void;
 }
+
+let settingsOpenMock = mock(() => undefined);
+
+function createProjectContextValue(
+  overrides: Partial<ProjectContextModule.ProjectContext> = {}
+): ProjectContextModule.ProjectContext {
+  return {
+    userProjects: new Map(),
+    systemProjectPath: null,
+    resolveProjectPath: () => null,
+    getProjectConfig: () => undefined,
+    loading: false,
+    refreshProjects: () => Promise.resolve(),
+    addProject: () => undefined,
+    removeProject: () => Promise.resolve({ success: true }),
+    isProjectCreateModalOpen: false,
+    openProjectCreateModal: () => undefined,
+    closeProjectCreateModal: () => undefined,
+    workspaceModalState: {
+      isOpen: false,
+      projectPath: null,
+      projectName: "",
+      branches: [],
+      defaultTrunkBranch: undefined,
+      loadErrorMessage: null,
+      isLoading: false,
+    },
+    openWorkspaceModal: () => Promise.resolve(),
+    closeWorkspaceModal: () => undefined,
+    getBranchesForProject: () => Promise.resolve({ branches: [], recommendedTrunk: null }),
+    getSecrets: () => Promise.resolve([]),
+    updateSecrets: () => Promise.resolve(),
+    updateDisplayName: () => resolveVoidResult(),
+    createSection: () =>
+      Promise.resolve({ success: true, data: { id: "section-1", name: "Section" } }),
+    updateSection: () => resolveVoidResult(),
+    removeSection: () => resolveVoidResult(),
+    reorderSections: () => resolveVoidResult(),
+    assignWorkspaceToSection: () => resolveVoidResult(),
+    hasAnyProject: false,
+    resolveNewChatProjectPath: () => null,
+    ...overrides,
+  };
+}
+
+let projectContextValue = createProjectContextValue();
 
 function installProjectSidebarTestDoubles() {
   spyOn(MuxLogoDarkModule, "default").mockImplementation((() => (
@@ -109,41 +156,7 @@ function installProjectSidebarTestDoubles() {
   spyOn(ConfirmDialogContextModule, "useConfirmDialog").mockImplementation(() => ({
     confirm: () => Promise.resolve(true),
   }));
-  spyOn(ProjectContextModule, "useProjectContext").mockImplementation(() => ({
-    userProjects: new Map(),
-    systemProjectPath: null,
-    resolveProjectPath: () => null,
-    getProjectConfig: () => undefined,
-    loading: false,
-    refreshProjects: () => Promise.resolve(),
-    addProject: () => undefined,
-    removeProject: () => Promise.resolve({ success: true }),
-    isProjectCreateModalOpen: false,
-    openProjectCreateModal: () => undefined,
-    closeProjectCreateModal: () => undefined,
-    workspaceModalState: {
-      isOpen: false,
-      projectPath: null,
-      projectName: "",
-      branches: [],
-      defaultTrunkBranch: undefined,
-      loadErrorMessage: null,
-      isLoading: false,
-    },
-    openWorkspaceModal: () => Promise.resolve(),
-    closeWorkspaceModal: () => undefined,
-    getBranchesForProject: () => Promise.resolve({ branches: [], recommendedTrunk: null }),
-    getSecrets: () => Promise.resolve([]),
-    updateSecrets: () => Promise.resolve(),
-    createSection: () =>
-      Promise.resolve({ success: true, data: { id: "section-1", name: "Section" } }),
-    updateSection: () => resolveVoidResult(),
-    removeSection: () => resolveVoidResult(),
-    reorderSections: () => resolveVoidResult(),
-    assignWorkspaceToSection: () => resolveVoidResult(),
-    hasAnyProject: false,
-    resolveNewChatProjectPath: () => null,
-  }));
+  spyOn(ProjectContextModule, "useProjectContext").mockImplementation(() => projectContextValue);
   spyOn(RouterContextModule, "useRouter").mockImplementation(() => ({
     navigateToWorkspace: () => undefined,
     navigateToProject: () => undefined,
@@ -163,7 +176,7 @@ function installProjectSidebarTestDoubles() {
   spyOn(SettingsContextModule, "useSettings").mockImplementation(() => ({
     isOpen: false,
     activeSection: "general",
-    open: () => undefined,
+    open: settingsOpenMock,
     close: () => undefined,
     setActiveSection: () => undefined,
     registerOnClose: () => () => undefined,
@@ -225,8 +238,15 @@ function installProjectSidebarTestDoubles() {
     (() => null) as unknown as typeof ConfirmationModalModule.ConfirmationModal
   );
   spyOn(ProjectDeleteConfirmationModalModule, "ProjectDeleteConfirmationModal").mockImplementation(
-    (() =>
-      null) as unknown as typeof ProjectDeleteConfirmationModalModule.ProjectDeleteConfirmationModal
+    ((props: {
+      isOpen: boolean;
+      projectName: string;
+      onConfirm: () => void;
+      onCancel: () => void;
+    }) =>
+      props.isOpen ? (
+        <div data-testid="project-delete-confirmation-modal">{props.projectName}</div>
+      ) : null) as unknown as typeof ProjectDeleteConfirmationModalModule.ProjectDeleteConfirmationModal
   );
   spyOn(WorkspaceStatusIndicatorModule, "WorkspaceStatusIndicator").mockImplementation((() => (
     <div data-testid="workspace-status-indicator" />
@@ -259,6 +279,11 @@ function installProjectSidebarTestDoubles() {
       (props.rowRenderMeta?.hasHiddenCompletedChildren ?? false) ||
       (props.rowRenderMeta?.visibleCompletedChildrenCount ?? 0) > 0;
 
+    const displayTitle =
+      props.metadata.bestOf?.kind === "variants" && props.metadata.bestOf.label
+        ? `${props.metadata.bestOf.label} · ${props.metadata.title ?? props.metadata.name}`
+        : (props.metadata.title ?? props.metadata.name);
+
     return (
       <div
         data-testid={agentItemTestId(props.metadata.id)}
@@ -266,7 +291,7 @@ function installProjectSidebarTestDoubles() {
         data-row-kind={props.rowRenderMeta?.rowKind ?? "unknown"}
         data-completed-expanded={String(props.completedChildrenExpanded ?? false)}
       >
-        <span>{props.metadata.title ?? props.metadata.name}</span>
+        <span>{displayTitle}</span>
         {hasCompletedChildren && props.onToggleCompletedChildren ? (
           <button
             type="button"
@@ -279,6 +304,28 @@ function installProjectSidebarTestDoubles() {
       </div>
     );
   }) as unknown as typeof AgentListItemModule.AgentListItem);
+  spyOn(PositionedMenuModule, "PositionedMenu").mockImplementation(((props: {
+    open: boolean;
+    children: React.ReactNode;
+  }) =>
+    props.open ? (
+      <div data-testid="project-actions-menu">{props.children}</div>
+    ) : null) as unknown as typeof PositionedMenuModule.PositionedMenu);
+  spyOn(PositionedMenuModule, "PositionedMenuItem").mockImplementation(((props: {
+    label: string;
+    disabled?: boolean;
+    onClick: (event: React.MouseEvent<HTMLButtonElement>) => void;
+  }) => (
+    <button
+      type="button"
+      disabled={props.disabled}
+      onClick={(event) => {
+        props.onClick(event);
+      }}
+    >
+      {props.label}
+    </button>
+  )) as unknown as typeof PositionedMenuModule.PositionedMenuItem);
 }
 
 function createWorkspace(
@@ -287,6 +334,7 @@ function createWorkspace(
     parentWorkspaceId?: string;
     taskStatus?: FrontendWorkspaceMetadata["taskStatus"];
     title?: string;
+    bestOf?: FrontendWorkspaceMetadata["bestOf"];
   }
 ): FrontendWorkspaceMetadata {
   return {
@@ -303,6 +351,7 @@ function createWorkspace(
     runtimeConfig: DEFAULT_RUNTIME_CONFIG,
     parentWorkspaceId: opts?.parentWorkspaceId,
     taskStatus: opts?.taskStatus,
+    bestOf: opts?.bestOf,
   };
 }
 
@@ -316,6 +365,8 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       EXPANDED_PROJECTS_KEY,
       JSON.stringify([MULTI_PROJECT_SIDEBAR_SECTION_ID])
     );
+    settingsOpenMock = mock(() => undefined);
+    projectContextValue = createProjectContextValue();
     installProjectSidebarTestDoubles();
   });
 
@@ -393,5 +444,468 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     expect(expandedParentRow.dataset.completedExpanded).toBe("true");
     expect(childRow.dataset.rowKind).toBe("subagent");
     expect(childRow.dataset.depth).toBe("1");
+  });
+
+  test("coalesces best-of sub-agents into a single sidebar row until expanded", async () => {
+    window.localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify(["/projects/demo-project"]));
+
+    const singleProjectRefs = [
+      { projectPath: "/projects/demo-project", projectName: "demo-project" },
+    ];
+    const parentWorkspace = {
+      ...createWorkspace("parent", { title: "Parent workspace" }),
+      projects: singleProjectRefs,
+    };
+    const bestOfGroup = { groupId: "best-of-demo", index: 0, total: 3 } as const;
+    const childOne = {
+      ...createWorkspace("child-1", {
+        parentWorkspaceId: "parent",
+        taskStatus: "running",
+        title: "Compare implementation options",
+        bestOf: bestOfGroup,
+      }),
+      projects: singleProjectRefs,
+    };
+    const childTwo = {
+      ...createWorkspace("child-2", {
+        parentWorkspaceId: "parent",
+        taskStatus: "queued",
+        title: "Compare implementation options",
+        bestOf: { ...bestOfGroup, index: 1 },
+      }),
+      projects: singleProjectRefs,
+    };
+    const childThree = {
+      ...createWorkspace("child-3", {
+        parentWorkspaceId: "parent",
+        taskStatus: "running",
+        title: "Compare implementation options",
+        bestOf: { ...bestOfGroup, index: 2 },
+      }),
+      projects: singleProjectRefs,
+    };
+
+    const sortedWorkspacesByProject = new Map([
+      ["/projects/demo-project", [parentWorkspace, childOne, childTwo, childThree]],
+    ]);
+
+    const projectConfig = { workspaces: [] };
+    spyOn(ProjectContextModule, "useProjectContext").mockImplementation(() => ({
+      userProjects: new Map([["/projects/demo-project", projectConfig]]),
+      systemProjectPath: null,
+      resolveProjectPath: () => null,
+      getProjectConfig: () => projectConfig,
+      loading: false,
+      refreshProjects: () => Promise.resolve(),
+      addProject: () => undefined,
+      removeProject: () => Promise.resolve({ success: true }),
+      isProjectCreateModalOpen: false,
+      openProjectCreateModal: () => undefined,
+      closeProjectCreateModal: () => undefined,
+      workspaceModalState: {
+        isOpen: false,
+        projectPath: null,
+        projectName: "",
+        branches: [],
+        defaultTrunkBranch: undefined,
+        loadErrorMessage: null,
+        isLoading: false,
+      },
+      openWorkspaceModal: () => Promise.resolve(),
+      closeWorkspaceModal: () => undefined,
+      getBranchesForProject: () => Promise.resolve({ branches: [], recommendedTrunk: null }),
+      getSecrets: () => Promise.resolve([]),
+      updateSecrets: () => Promise.resolve(),
+      updateDisplayName: () => resolveVoidResult(),
+      createSection: () =>
+        Promise.resolve({ success: true, data: { id: "section-1", name: "Section" } }),
+      updateSection: () => resolveVoidResult(),
+      removeSection: () => resolveVoidResult(),
+      reorderSections: () => resolveVoidResult(),
+      assignWorkspaceToSection: () => resolveVoidResult(),
+      hasAnyProject: true,
+      resolveNewChatProjectPath: () => "/projects/demo-project",
+    }));
+
+    const workspaceRecency = {
+      parent: Date.now(),
+      "child-1": Date.now(),
+      "child-2": Date.now(),
+      "child-3": Date.now(),
+    };
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={sortedWorkspacesByProject}
+        workspaceRecency={workspaceRecency}
+      />
+    );
+
+    expect(view.getByTestId(agentItemTestId("parent"))).toBeTruthy();
+    const groupRow = view.getByTestId("task-group-best-of-demo");
+    expect(groupRow.textContent).toContain("Best of 3");
+    expect(view.queryByTestId(agentItemTestId("child-1"))).toBeNull();
+    expect(view.queryByTestId(agentItemTestId("child-2"))).toBeNull();
+    expect(view.queryByTestId(agentItemTestId("child-3"))).toBeNull();
+
+    fireEvent.click(groupRow);
+
+    await waitFor(() => {
+      expect(view.getByTestId(agentItemTestId("child-1"))).toBeTruthy();
+      expect(view.getByTestId(agentItemTestId("child-2"))).toBeTruthy();
+      expect(view.getByTestId(agentItemTestId("child-3"))).toBeTruthy();
+    });
+  });
+
+  test("renders variants groups with a shared row and labeled members when expanded", async () => {
+    window.localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify(["/projects/demo-project"]));
+
+    const singleProjectRefs = [
+      { projectPath: "/projects/demo-project", projectName: "demo-project" },
+    ];
+    const parentWorkspace = {
+      ...createWorkspace("parent", { title: "Parent workspace" }),
+      projects: singleProjectRefs,
+    };
+    const taskGroup = {
+      groupId: "variants-demo",
+      index: 0,
+      total: 2,
+      kind: "variants",
+      label: "frontend",
+    } as const;
+    const childOne = {
+      ...createWorkspace("child-1", {
+        parentWorkspaceId: "parent",
+        taskStatus: "running",
+        title: "Split review",
+        bestOf: taskGroup,
+      }),
+      projects: singleProjectRefs,
+    };
+    const childTwo = {
+      ...createWorkspace("child-2", {
+        parentWorkspaceId: "parent",
+        taskStatus: "queued",
+        title: "Split review",
+        bestOf: { ...taskGroup, index: 1, label: "backend" },
+      }),
+      projects: singleProjectRefs,
+    };
+
+    const sortedWorkspacesByProject = new Map([
+      ["/projects/demo-project", [parentWorkspace, childOne, childTwo]],
+    ]);
+
+    const projectConfig = { workspaces: [] };
+    spyOn(ProjectContextModule, "useProjectContext").mockImplementation(() => ({
+      userProjects: new Map([["/projects/demo-project", projectConfig]]),
+      systemProjectPath: null,
+      resolveProjectPath: () => null,
+      getProjectConfig: () => projectConfig,
+      loading: false,
+      refreshProjects: () => Promise.resolve(),
+      addProject: () => undefined,
+      removeProject: () => Promise.resolve({ success: true }),
+      isProjectCreateModalOpen: false,
+      openProjectCreateModal: () => undefined,
+      closeProjectCreateModal: () => undefined,
+      workspaceModalState: {
+        isOpen: false,
+        projectPath: null,
+        projectName: "",
+        branches: [],
+        defaultTrunkBranch: undefined,
+        loadErrorMessage: null,
+        isLoading: false,
+      },
+      openWorkspaceModal: () => Promise.resolve(),
+      closeWorkspaceModal: () => undefined,
+      getBranchesForProject: () => Promise.resolve({ branches: [], recommendedTrunk: null }),
+      getSecrets: () => Promise.resolve([]),
+      updateSecrets: () => Promise.resolve(),
+      updateDisplayName: () => resolveVoidResult(),
+      createSection: () =>
+        Promise.resolve({ success: true, data: { id: "section-1", name: "Section" } }),
+      updateSection: () => resolveVoidResult(),
+      removeSection: () => resolveVoidResult(),
+      reorderSections: () => resolveVoidResult(),
+      assignWorkspaceToSection: () => resolveVoidResult(),
+      hasAnyProject: true,
+      resolveNewChatProjectPath: () => "/projects/demo-project",
+    }));
+
+    const workspaceRecency = {
+      parent: Date.now(),
+      "child-1": Date.now(),
+      "child-2": Date.now(),
+    };
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={sortedWorkspacesByProject}
+        workspaceRecency={workspaceRecency}
+      />
+    );
+
+    const groupRow = view.getByTestId("task-group-variants-demo");
+    expect(groupRow.textContent).toContain("Variants · Split review");
+    expect(view.queryByTestId(agentItemTestId("child-1"))).toBeNull();
+    expect(view.queryByTestId(agentItemTestId("child-2"))).toBeNull();
+
+    fireEvent.click(groupRow);
+
+    await waitFor(() => {
+      expect(view.getByText("frontend · Split review")).toBeTruthy();
+      expect(view.getByText("backend · Split review")).toBeTruthy();
+    });
+  });
+
+  test("does not coalesce a best-of group when one candidate still has hidden child tasks", () => {
+    window.localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify(["/projects/demo-project"]));
+
+    const singleProjectRefs = [
+      { projectPath: "/projects/demo-project", projectName: "demo-project" },
+    ];
+    const parentWorkspace = {
+      ...createWorkspace("parent", { title: "Parent workspace" }),
+      projects: singleProjectRefs,
+    };
+    const bestOfGroup = { groupId: "best-of-non-leaf", index: 0, total: 2 } as const;
+    const childOne = {
+      ...createWorkspace("child-1", {
+        parentWorkspaceId: "parent",
+        taskStatus: "running",
+        title: "Compare implementation options",
+        bestOf: bestOfGroup,
+      }),
+      projects: singleProjectRefs,
+    };
+    const hiddenGrandchild = {
+      ...createWorkspace("grandchild-1", {
+        parentWorkspaceId: "child-1",
+        taskStatus: "reported",
+        title: "Nested follow-up",
+      }),
+      projects: singleProjectRefs,
+    };
+    const childTwo = {
+      ...createWorkspace("child-2", {
+        parentWorkspaceId: "parent",
+        taskStatus: "running",
+        title: "Compare implementation options",
+        bestOf: { ...bestOfGroup, index: 1 },
+      }),
+      projects: singleProjectRefs,
+    };
+
+    const sortedWorkspacesByProject = new Map([
+      ["/projects/demo-project", [parentWorkspace, childOne, hiddenGrandchild, childTwo]],
+    ]);
+
+    const projectConfig = { workspaces: [] };
+    spyOn(ProjectContextModule, "useProjectContext").mockImplementation(() => ({
+      userProjects: new Map([["/projects/demo-project", projectConfig]]),
+      systemProjectPath: null,
+      resolveProjectPath: () => null,
+      getProjectConfig: () => projectConfig,
+      loading: false,
+      refreshProjects: () => Promise.resolve(),
+      addProject: () => undefined,
+      removeProject: () => Promise.resolve({ success: true }),
+      isProjectCreateModalOpen: false,
+      openProjectCreateModal: () => undefined,
+      closeProjectCreateModal: () => undefined,
+      workspaceModalState: {
+        isOpen: false,
+        projectPath: null,
+        projectName: "",
+        branches: [],
+        defaultTrunkBranch: undefined,
+        loadErrorMessage: null,
+        isLoading: false,
+      },
+      openWorkspaceModal: () => Promise.resolve(),
+      closeWorkspaceModal: () => undefined,
+      getBranchesForProject: () => Promise.resolve({ branches: [], recommendedTrunk: null }),
+      getSecrets: () => Promise.resolve([]),
+      updateSecrets: () => Promise.resolve(),
+      updateDisplayName: () => resolveVoidResult(),
+      createSection: () =>
+        Promise.resolve({ success: true, data: { id: "section-1", name: "Section" } }),
+      updateSection: () => resolveVoidResult(),
+      removeSection: () => resolveVoidResult(),
+      reorderSections: () => resolveVoidResult(),
+      assignWorkspaceToSection: () => resolveVoidResult(),
+      hasAnyProject: true,
+      resolveNewChatProjectPath: () => "/projects/demo-project",
+    }));
+
+    const workspaceRecency = {
+      parent: Date.now(),
+      "child-1": Date.now(),
+      "grandchild-1": Date.now(),
+      "child-2": Date.now(),
+    };
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={sortedWorkspacesByProject}
+        workspaceRecency={workspaceRecency}
+      />
+    );
+
+    expect(view.queryByTestId("task-group-best-of-non-leaf")).toBeNull();
+    expect(view.getByTestId(agentItemTestId("child-1"))).toBeTruthy();
+    expect(view.getByTestId(agentItemTestId("child-2"))).toBeTruthy();
+    expect(view.queryByTestId(agentItemTestId("grandchild-1"))).toBeNull();
+  });
+});
+
+describe("ProjectSidebar project actions menu", () => {
+  const demoProjectPath = "/projects/demo-project";
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    window.localStorage.clear();
+    window.localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify([demoProjectPath]));
+
+    settingsOpenMock = mock(() => undefined);
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([[demoProjectPath, { workspaces: [] }]]),
+    });
+
+    installProjectSidebarTestDoubles();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+    mock.restore();
+  });
+
+  function renderSidebar() {
+    return render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map()}
+        workspaceRecency={{}}
+      />
+    );
+  }
+
+  test("renders always-visible new-chat and kebab buttons, and opens menu from kebab", () => {
+    const view = renderSidebar();
+
+    expect(view.getByRole("button", { name: "New chat in demo-project" })).toBeTruthy();
+    const projectOptionsButton = view.getByRole("button", {
+      name: "Project options for demo-project",
+    });
+
+    fireEvent.click(projectOptionsButton);
+
+    const menu = view.getByTestId("project-actions-menu");
+    const menuButtons = within(menu).getAllByRole("button");
+    expect(menuButtons.map((button) => button.textContent)).toEqual([
+      "Edit name",
+      "Manage secrets",
+      "Delete...",
+    ]);
+  });
+
+  test("opens the same project actions menu on right-click", () => {
+    const view = renderSidebar();
+
+    fireEvent.contextMenu(view.getByText("demo-project"));
+
+    expect(view.getByTestId("project-actions-menu")).toBeTruthy();
+    expect(view.getByRole("button", { name: "Edit name" })).toBeTruthy();
+  });
+
+  test("menu actions route to settings and delete confirmation", () => {
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        [demoProjectPath, { workspaces: [{ path: `${demoProjectPath}/ws-1` }] }],
+      ]),
+    });
+
+    const view = renderSidebar();
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Manage secrets" }));
+
+    expect(settingsOpenMock).toHaveBeenCalledWith("secrets", {
+      secretsProjectPath: demoProjectPath,
+    });
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Delete..." }));
+
+    expect(view.getByTestId("project-delete-confirmation-modal").textContent).toBe("demo-project");
+  });
+
+  test("supports inline project name editing with Enter, Escape, and empty-to-null commit", async () => {
+    const updateDisplayName = mock(() => resolveVoidResult());
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([[demoProjectPath, { workspaces: [], displayName: "Custom Name" }]]),
+      updateDisplayName,
+    });
+
+    const view = renderSidebar();
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Edit name" }));
+
+    const input = view.getByRole("textbox", { name: "Edit project name for demo-project" });
+    expect((input as HTMLInputElement).value).toBe("Custom Name");
+
+    fireEvent.change(input, { target: { value: "  Renamed Project  " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => {
+      expect(updateDisplayName).toHaveBeenCalledWith(demoProjectPath, "Renamed Project");
+    });
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Edit name" }));
+
+    const escapeInput = view.getByRole("textbox", { name: "Edit project name for demo-project" });
+    fireEvent.change(escapeInput, { target: { value: "Do not save" } });
+    fireEvent.keyDown(escapeInput, { key: "Escape" });
+
+    expect(updateDisplayName.mock.calls.length).toBe(1);
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Edit name" }));
+
+    const emptyInput = view.getByRole("textbox", { name: "Edit project name for demo-project" });
+    fireEvent.change(emptyInput, { target: { value: "   " } });
+    fireEvent.blur(emptyInput);
+
+    await waitFor(() => {
+      expect(updateDisplayName).toHaveBeenCalledWith(demoProjectPath, null);
+    });
+  });
+
+  test("renders displayName when set and falls back to basename when unset", () => {
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/custom-name-project", { workspaces: [], displayName: "Custom Label" }],
+        ["/projects/fallback-project", { workspaces: [] }],
+      ]),
+    });
+
+    const view = renderSidebar();
+
+    expect(view.getByText("Custom Label")).toBeTruthy();
+    expect(view.getByText("fallback-project")).toBeTruthy();
   });
 });

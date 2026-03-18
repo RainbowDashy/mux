@@ -13,13 +13,19 @@ import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { SessionTimingService } from "./sessionTimingService";
+import { SessionUsageService } from "./sessionUsageService";
 import type { AIService } from "./aiService";
 import type { InitStateManager, InitStatus } from "./initStateManager";
-import type { ExtensionMetadataService } from "./ExtensionMetadataService";
+import type {
+  ExtensionMetadataService,
+  ExtensionMetadataStreamingUpdate,
+} from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import type { TaskService } from "./taskService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { TerminalService } from "@/node/services/terminalService";
+import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { BrowserSessionService } from "@/node/services/browserSessionService";
 import type { BashToolResult } from "@/common/types/tools";
 import { createMuxMessage } from "@/common/types/message";
 import { MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
@@ -1006,7 +1012,7 @@ describe("WorkspaceService idle compaction dispatch", () => {
     }));
 
     svc.extensionMetadata = {
-      getMetadata: mock(() => Promise.resolve({ lastThinkingLevel: "off" })),
+      getSnapshot: mock(() => Promise.resolve({ lastThinkingLevel: "off" })),
     } as unknown as ExtensionMetadataService;
 
     const options = await svc.buildIdleCompactionSendOptions("ws");
@@ -1048,8 +1054,7 @@ describe("WorkspaceService idle compaction dispatch", () => {
       updateStreamingStatus: (
         workspaceId: string,
         streaming: boolean,
-        model?: string,
-        agentId?: string
+        options?: ExtensionMetadataStreamingUpdate
       ) => Promise<void>;
     };
 
@@ -1057,10 +1062,59 @@ describe("WorkspaceService idle compaction dispatch", () => {
 
     await internals.updateStreamingStatus(workspaceId, true);
 
-    expect(setStreaming).toHaveBeenCalledWith(workspaceId, true, undefined, undefined, undefined);
+    expect(setStreaming).toHaveBeenCalledWith(workspaceId, true, {});
     expect(emitWorkspaceActivity).toHaveBeenCalledTimes(1);
     expect(emitWorkspaceActivity).toHaveBeenCalledWith(workspaceId, snapshot);
     expect(internals.idleCompactingWorkspaces.has(workspaceId)).toBe(true);
+  });
+
+  test("passes through stream-start thinkingLevel without re-deriving it from config", async () => {
+    const workspaceId = "streaming-thinking-level";
+    const snapshot = {
+      recency: Date.now(),
+      streaming: true,
+      lastModel: "claude-sonnet-4",
+      lastThinkingLevel: "high" as const,
+    };
+
+    const setStreaming = mock(() => Promise.resolve(snapshot));
+    const emitWorkspaceActivity = mock(
+      (_workspaceId: string, _snapshot: typeof snapshot) => undefined
+    );
+
+    (
+      workspaceService as unknown as {
+        extensionMetadata: ExtensionMetadataService;
+        emitWorkspaceActivity: typeof emitWorkspaceActivity;
+      }
+    ).extensionMetadata = {
+      setStreaming,
+    } as unknown as ExtensionMetadataService;
+    (
+      workspaceService as unknown as {
+        extensionMetadata: ExtensionMetadataService;
+        emitWorkspaceActivity: typeof emitWorkspaceActivity;
+      }
+    ).emitWorkspaceActivity = emitWorkspaceActivity;
+
+    const internals = workspaceService as unknown as {
+      updateStreamingStatus: (
+        workspaceId: string,
+        streaming: boolean,
+        options?: ExtensionMetadataStreamingUpdate
+      ) => Promise<void>;
+    };
+
+    await internals.updateStreamingStatus(workspaceId, true, {
+      model: "claude-sonnet-4",
+      thinkingLevel: "high",
+    });
+
+    expect(setStreaming).toHaveBeenCalledWith(workspaceId, true, {
+      model: "claude-sonnet-4",
+      thinkingLevel: "high",
+    });
+    expect(emitWorkspaceActivity).toHaveBeenCalledWith(workspaceId, snapshot);
   });
 
   test("clears idle marker when streaming=false metadata update fails", async () => {
@@ -1082,8 +1136,7 @@ describe("WorkspaceService idle compaction dispatch", () => {
       updateStreamingStatus: (
         workspaceId: string,
         streaming: boolean,
-        model?: string,
-        agentId?: string
+        options?: ExtensionMetadataStreamingUpdate
       ) => Promise<void>;
     };
 
@@ -1092,7 +1145,7 @@ describe("WorkspaceService idle compaction dispatch", () => {
     await internals.updateStreamingStatus(workspaceId, false);
 
     expect(internals.idleCompactingWorkspaces.has(workspaceId)).toBe(false);
-    expect(setStreaming).toHaveBeenCalledWith(workspaceId, false, undefined, undefined, false);
+    expect(setStreaming).toHaveBeenCalledWith(workspaceId, false, { hasTodos: false });
   });
 });
 
@@ -1146,19 +1199,13 @@ describe("WorkspaceService streaming generation guard", () => {
       createDeferred<Awaited<ReturnType<typeof todoStorageModule.readTodosForSessionDir>>>();
     let todoReadCalls = 0;
     const setStreaming = mock(
-      (
-        _workspaceId: string,
-        streaming: boolean,
-        model?: string,
-        _thinkingLevel?: string | null,
-        hasTodos?: boolean
-      ) =>
+      (_workspaceId: string, streaming: boolean, update: ExtensionMetadataStreamingUpdate = {}) =>
         Promise.resolve({
           recency: Date.now(),
           streaming,
-          lastModel: model ?? null,
-          lastThinkingLevel: null,
-          hasTodos,
+          lastModel: update.model ?? null,
+          lastThinkingLevel: update.thinkingLevel ?? null,
+          hasTodos: update.hasTodos,
           agentStatus: null,
         })
     );
@@ -1184,56 +1231,36 @@ describe("WorkspaceService streaming generation guard", () => {
       updateStreamingStatus: (
         workspaceId: string,
         streaming: boolean,
-        model?: string,
-        agentId?: string,
-        hasTodos?: boolean,
-        expectedGeneration?: number
+        options?: ExtensionMetadataStreamingUpdate
       ) => Promise<void>;
     };
 
     internals.streamingGenerations.set(workspaceId, 1);
-    const staleStopPromise = internals.updateStreamingStatus(
-      workspaceId,
-      false,
-      undefined,
-      undefined,
-      undefined,
-      1
-    );
+    const staleStopPromise = internals.updateStreamingStatus(workspaceId, false, {
+      generation: 1,
+    });
 
     internals.streamingGenerations.set(workspaceId, 2);
-    await internals.updateStreamingStatus(workspaceId, true, "openai:gpt-4o");
+    await internals.updateStreamingStatus(workspaceId, true, { model: "openai:gpt-4o" });
 
     todoReadDeferred.resolve([]);
     await staleStopPromise;
 
     expect(setStreaming).toHaveBeenCalledTimes(1);
-    expect(setStreaming).toHaveBeenCalledWith(
-      workspaceId,
-      true,
-      "openai:gpt-4o",
-      undefined,
-      undefined
-    );
+    expect(setStreaming).toHaveBeenCalledWith(workspaceId, true, { model: "openai:gpt-4o" });
   });
 
   test("handleStreamCompletion captures generation before awaiting recency updates", async () => {
     const workspaceId = "ws-stream-completion-generation";
     const recencyDeferred = createDeferred<void>();
     const setStreaming = mock(
-      (
-        _workspaceId: string,
-        streaming: boolean,
-        model?: string,
-        _thinkingLevel?: string | null,
-        hasTodos?: boolean
-      ) =>
+      (_workspaceId: string, streaming: boolean, update: ExtensionMetadataStreamingUpdate = {}) =>
         Promise.resolve({
           recency: Date.now(),
           streaming,
-          lastModel: model ?? null,
-          lastThinkingLevel: null,
-          hasTodos,
+          lastModel: update.model ?? null,
+          lastThinkingLevel: update.thinkingLevel ?? null,
+          hasTodos: update.hasTodos,
           agentStatus: null,
         })
     );
@@ -1246,10 +1273,7 @@ describe("WorkspaceService streaming generation guard", () => {
       updateStreamingStatus: (
         workspaceId: string,
         streaming: boolean,
-        model?: string,
-        agentId?: string,
-        hasTodos?: boolean,
-        expectedGeneration?: number
+        options?: ExtensionMetadataStreamingUpdate
       ) => Promise<void>;
       updateRecencyTimestamp: (workspaceId: string, timestamp?: number) => Promise<void>;
       handleStreamCompletion: (workspaceId: string) => Promise<void>;
@@ -1264,20 +1288,14 @@ describe("WorkspaceService streaming generation guard", () => {
     const completionPromise = internals.handleStreamCompletion(workspaceId);
 
     internals.streamingGenerations.set(workspaceId, 2);
-    await internals.updateStreamingStatus(workspaceId, true, "openai:gpt-4o-mini");
+    await internals.updateStreamingStatus(workspaceId, true, { model: "openai:gpt-4o-mini" });
 
     recencyDeferred.resolve();
     await completionPromise;
 
     expect(internals.updateRecencyTimestamp).toHaveBeenCalledTimes(1);
     expect(setStreaming).toHaveBeenCalledTimes(1);
-    expect(setStreaming).toHaveBeenCalledWith(
-      workspaceId,
-      true,
-      "openai:gpt-4o-mini",
-      undefined,
-      undefined
-    );
+    expect(setStreaming).toHaveBeenCalledWith(workspaceId, true, { model: "openai:gpt-4o-mini" });
   });
 });
 
@@ -2610,6 +2628,82 @@ describe("WorkspaceService remove timing rollup", () => {
   });
 });
 
+describe("WorkspaceService remove desktop session cleanup", () => {
+  const workspaceId = "ws-remove-desktop";
+
+  let historyService: HistoryService;
+  let cleanupHistory: () => Promise<void>;
+  let workspaceService: WorkspaceService;
+  let removeWorkspaceMock: ReturnType<typeof mock>;
+  let tempRoot: string;
+
+  beforeEach(async () => {
+    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+    tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-remove-desktop-"));
+    removeWorkspaceMock = mock(() => Promise.resolve());
+
+    const aiService: AIService = {
+      isStreaming: mock(() => false),
+      stopStream: mock(() => Promise.resolve(Ok(undefined))),
+      getWorkspaceMetadata: mock(() => Promise.resolve(Err("not found"))),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      on: mock(() => {}),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      off: mock(() => {}),
+    } as unknown as AIService;
+
+    const mockConfig: Partial<Config> = {
+      srcDir: "/tmp/src",
+      getSessionDir: mock((id: string) => path.join(tempRoot, "sessions", id)),
+      removeWorkspace: removeWorkspaceMock,
+      findWorkspace: mock(() => null),
+    };
+
+    workspaceService = new WorkspaceService(
+      mockConfig as Config,
+      historyService,
+      aiService,
+      mockInitStateManager as InitStateManager,
+      mockExtensionMetadataService as ExtensionMetadataService,
+      mockBackgroundProcessManager as BackgroundProcessManager
+    );
+  });
+
+  afterEach(async () => {
+    await fsPromises.rm(tempRoot, { recursive: true, force: true });
+    await cleanupHistory();
+  });
+
+  test("remove() closes desktop sessions on success", async () => {
+    const close = mock(() => Promise.resolve(undefined));
+    const desktopSessionManager = {
+      close,
+    } as unknown as DesktopSessionManager;
+    workspaceService.setDesktopSessionManager(desktopSessionManager);
+
+    const result = await workspaceService.remove(workspaceId);
+
+    expect(result.success).toBe(true);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledWith(workspaceId);
+  });
+
+  test("remove() continues when desktop session cleanup fails", async () => {
+    const close = mock(() => Promise.reject(new Error("close failed")));
+    const desktopSessionManager = {
+      close,
+    } as unknown as DesktopSessionManager;
+    workspaceService.setDesktopSessionManager(desktopSessionManager);
+
+    const result = await workspaceService.remove(workspaceId);
+
+    expect(result.success).toBe(true);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledWith(workspaceId);
+    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspaceId);
+  });
+});
+
 describe("WorkspaceService metadata listeners", () => {
   let historyService: HistoryService;
   let cleanupHistory: () => Promise<void>;
@@ -2669,7 +2763,10 @@ describe("WorkspaceService metadata listeners", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(setStreaming).toHaveBeenCalledTimes(1);
-    expect(setStreaming).toHaveBeenCalledWith(workspaceId, false, undefined, undefined, false);
+    expect(setStreaming).toHaveBeenCalledWith(workspaceId, false, {
+      hasTodos: false,
+      generation: 0,
+    });
   });
 });
 
@@ -2803,6 +2900,20 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(closeWorkspaceSessions).toHaveBeenCalledWith(workspaceId);
   });
 
+  test("archive() stops workspace browser sessions on success", async () => {
+    const stopSession = mock((_workspaceId: string) => Promise.resolve());
+    const browserSessionService = {
+      stopSession,
+    } as unknown as BrowserSessionService;
+    workspaceService.setBrowserSessionService(browserSessionService);
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result.success).toBe(true);
+    expect(stopSession).toHaveBeenCalledTimes(1);
+    expect(stopSession).toHaveBeenCalledWith(workspaceId);
+  });
+
   test("archive() does not close terminal sessions when beforeArchive hook fails", async () => {
     const hooks = new WorkspaceLifecycleHooks();
     hooks.registerBeforeArchive(() => Promise.resolve(Err("hook failed")));
@@ -2818,6 +2929,71 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
     expect(result.success).toBe(false);
     expect(closeWorkspaceSessions).not.toHaveBeenCalled();
+  });
+
+  test("archive() closes desktop sessions on success", async () => {
+    const close = mock(() => Promise.resolve(undefined));
+    const desktopSessionManager = {
+      close,
+    } as unknown as DesktopSessionManager;
+    workspaceService.setDesktopSessionManager(desktopSessionManager);
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result.success).toBe(true);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledWith(workspaceId);
+  });
+
+  test("archive() does not close desktop sessions when beforeArchive hook fails", async () => {
+    const hooks = new WorkspaceLifecycleHooks();
+    hooks.registerBeforeArchive(() => Promise.resolve(Err("hook failed")));
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+
+    const close = mock(() => Promise.resolve(undefined));
+    const desktopSessionManager = {
+      close,
+    } as unknown as DesktopSessionManager;
+    workspaceService.setDesktopSessionManager(desktopSessionManager);
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result.success).toBe(false);
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  test("archive() does not stop browser sessions when beforeArchive hook fails", async () => {
+    const hooks = new WorkspaceLifecycleHooks();
+    hooks.registerBeforeArchive(() => Promise.resolve(Err("hook failed")));
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+
+    const stopSession = mock((_workspaceId: string) => Promise.resolve());
+    const browserSessionService = {
+      stopSession,
+    } as unknown as BrowserSessionService;
+    workspaceService.setBrowserSessionService(browserSessionService);
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result.success).toBe(false);
+    expect(stopSession).not.toHaveBeenCalled();
+  });
+
+  test("archive() can stop browser sessions repeatedly without error", async () => {
+    const stopSession = mock((_workspaceId: string) => Promise.resolve());
+    const browserSessionService = {
+      stopSession,
+    } as unknown as BrowserSessionService;
+    workspaceService.setBrowserSessionService(browserSessionService);
+
+    const firstResult = await workspaceService.archive(workspaceId);
+    const secondResult = await workspaceService.archive(workspaceId);
+
+    expect(firstResult.success).toBe(true);
+    expect(secondResult.success).toBe(true);
+    expect(stopSession).toHaveBeenCalledTimes(2);
+    expect(stopSession).toHaveBeenNthCalledWith(1, workspaceId);
+    expect(stopSession).toHaveBeenNthCalledWith(2, workspaceId);
   });
 
   test("persists archivedAt when beforeArchive hooks succeed", async () => {
@@ -3749,7 +3925,7 @@ describe("WorkspaceService init cancellation", () => {
         return Promise.resolve();
       }),
       getAllWorkspaceMetadata: mock(() => Promise.resolve([mockMetadata])),
-      getEffectiveSecrets: mock(() => []),
+      getEffectiveSecrets: mock(() => [{ key: "GH_TOKEN", value: "token" }]),
       getSessionDir: mock(() => "/tmp/test/sessions"),
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({
@@ -3834,6 +4010,9 @@ describe("WorkspaceService init cancellation", () => {
         return;
       }
 
+      expect(createWorkspaceMock).toHaveBeenCalledWith(
+        expect.objectContaining({ env: { GH_TOKEN: "token" } })
+      );
       expect(result.data.metadata.isInitializing).toBe(undefined);
       expect(clearInMemoryStateMock).toHaveBeenCalledWith(workspaceId);
 
@@ -3894,6 +4073,51 @@ describe("WorkspaceService init cancellation", () => {
       expect(clearInMemoryStateMock).toHaveBeenCalledWith(workspaceId);
 
       expect(initAbortControllers.has(workspaceId)).toBe(false);
+    } finally {
+      await fsPromises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("remove() stops workspace browser sessions on success", async () => {
+    const workspaceId = "ws-remove-browser-cleanup";
+
+    const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-ws-remove-browser-"));
+    try {
+      const stopSession = mock((_workspaceId: string) => Promise.resolve());
+      const browserSessionService = {
+        stopSession,
+      } as unknown as BrowserSessionService;
+      const mockAIService = {
+        isStreaming: mock(() => false),
+        stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
+        getWorkspaceMetadata: mock(() => Promise.resolve({ success: false as const, error: "na" })),
+        // eslint-disable-next-line @typescript-eslint/no-empty-function
+        on: mock(() => {}),
+        // eslint-disable-next-line @typescript-eslint/no-empty-function
+        off: mock(() => {}),
+      } as unknown as AIService;
+
+      const mockConfig: Partial<Config> = {
+        srcDir: "/tmp/src",
+        getSessionDir: mock((id: string) => path.join(tempRoot, id)),
+        removeWorkspace: mock(() => Promise.resolve()),
+        findWorkspace: mock(() => null),
+      };
+      const workspaceService = new WorkspaceService(
+        mockConfig as Config,
+        historyService,
+        mockAIService,
+        mockInitStateManager as InitStateManager,
+        mockExtensionMetadataService as ExtensionMetadataService,
+        mockBackgroundProcessManager as BackgroundProcessManager
+      );
+      workspaceService.setBrowserSessionService(browserSessionService);
+
+      const result = await workspaceService.remove(workspaceId, true);
+
+      expect(result.success).toBe(true);
+      expect(stopSession).toHaveBeenCalledTimes(1);
+      expect(stopSession).toHaveBeenCalledWith(workspaceId);
     } finally {
       await fsPromises.rm(tempRoot, { recursive: true, force: true });
     }
@@ -4224,11 +4448,18 @@ describe("WorkspaceService regenerateTitle", () => {
 });
 
 describe("WorkspaceService fork", () => {
+  let config: Config;
+  let tempDir: string;
   let historyService: HistoryService;
   let cleanupHistory: () => Promise<void>;
 
   beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+    ({
+      config,
+      tempDir,
+      historyService,
+      cleanup: cleanupHistory,
+    } = await createTestHistoryService());
   });
 
   afterEach(async () => {
@@ -4275,6 +4506,7 @@ describe("WorkspaceService fork", () => {
       generateStableId: mock(() => newWorkspaceId),
       findWorkspace: mock(() => null),
       getSessionDir: mock(() => "/tmp/test/sessions"),
+      getEffectiveSecrets: mock(() => []),
       loadConfigOrDefault: mock(() => ({
         projects: new Map([[sourceProjectPath, { workspaces: [], trusted: true }]]),
       })),
@@ -4318,6 +4550,234 @@ describe("WorkspaceService fork", () => {
       orchestrateForkSpy.mockRestore();
       createRuntimeSpy.mockRestore();
       getOrCreateSessionSpy.mockRestore();
+    }
+  });
+  test("resets forked session usage while preserving copied history", async () => {
+    const sourceWorkspaceId = "source-workspace";
+    const newWorkspaceId = "forked-workspace";
+    const sourceProjectPath = path.join(tempDir, "project");
+    const sourceMetadata: FrontendWorkspaceMetadata = {
+      id: sourceWorkspaceId,
+      name: "source-branch",
+      projectPath: sourceProjectPath,
+      projectName: "project",
+      runtimeConfig: { type: "local" },
+      namedWorkspacePath: path.join(sourceProjectPath, "source-branch"),
+    };
+
+    await fsPromises.mkdir(sourceProjectPath, { recursive: true });
+    await config.addWorkspace(sourceProjectPath, sourceMetadata);
+    await config.editConfig((current) => {
+      const project = current.projects.get(sourceProjectPath);
+      if (!project) {
+        throw new Error("Expected test project config to exist");
+      }
+      project.trusted = true;
+      return current;
+    });
+
+    // Seed source history with assistant usage so the source cost ledger is non-empty
+    // before we fork. The fork should keep this history but not inherit its costs.
+    await historyService.appendToHistory(
+      sourceWorkspaceId,
+      createMuxMessage("assistant-1", "assistant", "Hello", {
+        model: "claude-sonnet-4-20250514",
+        usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+      })
+    );
+
+    const sessionUsageService = new SessionUsageService(config, historyService);
+    const sourceUsage = await sessionUsageService.getSessionUsage(sourceWorkspaceId);
+    expect(sourceUsage?.byModel["claude-sonnet-4-20250514"]?.input.tokens).toBe(100);
+
+    const mockAIService = {
+      isStreaming: mock(() => false),
+      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      on: mock(() => {}),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      off: mock(() => {}),
+    } as unknown as AIService;
+
+    const mockInitStateManager: Partial<InitStateManager> = {
+      on: mock(() => undefined as unknown as InitStateManager),
+      getInitState: mock(() => ({ status: "running" }) as unknown as InitStatus),
+      startInit: mock(() => undefined),
+      endInit: mock(() => Promise.resolve()),
+      appendOutput: mock(() => undefined),
+      enterHookPhase: mock(() => undefined),
+    };
+
+    const workspaceService = new WorkspaceService(
+      config,
+      historyService,
+      mockAIService,
+      mockInitStateManager as InitStateManager,
+      mockExtensionMetadataService as ExtensionMetadataService,
+      mockBackgroundProcessManager as BackgroundProcessManager,
+      sessionUsageService
+    );
+
+    const targetRuntime = {
+      getWorkspacePath: mock(() => path.join(sourceProjectPath, "fork-child")),
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
+
+    const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
+    const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
+      emitMetadata: mock(() => undefined),
+    } as unknown as AgentSession);
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
+      {} as ReturnType<typeof runtimeFactory.createRuntime>
+    );
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
+      () => undefined
+    );
+    const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
+      undefined
+    );
+    const orchestrateForkSpy = spyOn(forkOrchestratorModule, "orchestrateFork").mockResolvedValue(
+      Ok({
+        workspacePath: path.join(sourceProjectPath, "fork-child"),
+        trunkBranch: "main",
+        forkedRuntimeConfig: { type: "local" },
+        targetRuntime,
+        forkedFromSource: true,
+        sourceRuntimeConfigUpdated: false,
+      })
+    );
+
+    try {
+      const result = await workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(result.success).toBe(true);
+
+      const forkedUsage = await sessionUsageService.getSessionUsage(newWorkspaceId);
+      expect(forkedUsage).toEqual({ byModel: {}, version: 1 });
+
+      const forkedMessages: string[] = [];
+      const historyResult = await historyService.iterateFullHistory(
+        newWorkspaceId,
+        "forward",
+        (chunk) => {
+          forkedMessages.push(...chunk.map((message) => message.id));
+        }
+      );
+      expect(historyResult.success).toBe(true);
+      expect(forkedMessages).toContain("assistant-1");
+    } finally {
+      orchestrateForkSpy.mockRestore();
+      copyPlanSpy.mockRestore();
+      runBackgroundInitSpy.mockRestore();
+      createRuntimeSpy.mockRestore();
+      getOrCreateSessionSpy.mockRestore();
+      generateStableIdSpy.mockRestore();
+    }
+  });
+  test("auto-generated fork names increment existing fork suffixes instead of nesting them", async () => {
+    const sourceWorkspaceId = "source-workspace";
+    const newWorkspaceId = "forked-workspace";
+    const sourceProjectPath = path.join(tempDir, "project");
+    const sourceMetadata: FrontendWorkspaceMetadata = {
+      id: sourceWorkspaceId,
+      name: "source-branch-fork-2",
+      title: "Source branch (2)",
+      projectPath: sourceProjectPath,
+      projectName: "project",
+      runtimeConfig: { type: "local" },
+      namedWorkspacePath: path.join(sourceProjectPath, "source-branch-fork-2"),
+    };
+    const forkedWorkspacePath = path.join(sourceProjectPath, "source-branch-fork-3");
+
+    await fsPromises.mkdir(sourceProjectPath, { recursive: true });
+    await config.addWorkspace(sourceProjectPath, sourceMetadata);
+    await config.editConfig((current) => {
+      const project = current.projects.get(sourceProjectPath);
+      if (!project) {
+        throw new Error("Expected test project config to exist");
+      }
+      project.trusted = true;
+      return current;
+    });
+
+    const mockAIService = {
+      isStreaming: mock(() => false),
+      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      on: mock(() => {}),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      off: mock(() => {}),
+    } as unknown as AIService;
+
+    const mockInitStateManager: Partial<InitStateManager> = {
+      on: mock(() => undefined as unknown as InitStateManager),
+      getInitState: mock(() => ({ status: "running" }) as unknown as InitStatus),
+      startInit: mock(() => undefined),
+      endInit: mock(() => Promise.resolve()),
+      appendOutput: mock(() => undefined),
+      enterHookPhase: mock(() => undefined),
+    };
+
+    const workspaceService = new WorkspaceService(
+      config,
+      historyService,
+      mockAIService,
+      mockInitStateManager as InitStateManager,
+      mockExtensionMetadataService as ExtensionMetadataService,
+      mockBackgroundProcessManager as BackgroundProcessManager
+    );
+
+    const targetRuntime = {
+      getWorkspacePath: mock(() => forkedWorkspacePath),
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
+
+    const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
+    const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
+      emitMetadata: mock(() => undefined),
+    } as unknown as AgentSession);
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
+      {} as ReturnType<typeof runtimeFactory.createRuntime>
+    );
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
+      () => undefined
+    );
+    const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
+      undefined
+    );
+    const orchestrateForkSpy = spyOn(forkOrchestratorModule, "orchestrateFork").mockResolvedValue(
+      Ok({
+        workspacePath: forkedWorkspacePath,
+        trunkBranch: "main",
+        forkedRuntimeConfig: { type: "local" },
+        targetRuntime,
+        forkedFromSource: true,
+        sourceRuntimeConfigUpdated: false,
+      })
+    );
+
+    try {
+      const result = await workspaceService.fork(sourceWorkspaceId);
+
+      expect(orchestrateForkSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sourceWorkspaceName: sourceMetadata.name,
+          newWorkspaceName: "source-branch-fork-3",
+        })
+      );
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        throw new Error(`Expected success result, got error: ${result.error}`);
+      }
+
+      expect(result.data.metadata.name).toBe("source-branch-fork-3");
+      expect(result.data.metadata.title).toBe("Source branch (3)");
+      expect(result.data.metadata.namedWorkspacePath).toBe(forkedWorkspacePath);
+    } finally {
+      orchestrateForkSpy.mockRestore();
+      copyPlanSpy.mockRestore();
+      runBackgroundInitSpy.mockRestore();
+      createRuntimeSpy.mockRestore();
+      getOrCreateSessionSpy.mockRestore();
+      generateStableIdSpy.mockRestore();
     }
   });
 });
@@ -4415,6 +4875,10 @@ describe("generateForkBranchName", () => {
         "other-workspace",
       ])
     ).toBe("sidebar-a1b2-fork-4");
+  });
+
+  test("strips an existing fork suffix from the parent before incrementing", () => {
+    expect(generateForkBranchName("ws-fork-2", ["ws-fork-1", "ws-fork-2"])).toBe("ws-fork-3");
   });
 
   test("ignores non-matching workspace names", () => {

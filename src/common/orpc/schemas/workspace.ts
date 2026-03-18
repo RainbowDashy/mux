@@ -2,12 +2,33 @@ import { z } from "zod";
 import { ThinkingLevelSchema } from "../../types/thinking";
 import { RuntimeConfigSchema } from "./runtime";
 import { WorkspaceAISettingsByAgentSchema, WorkspaceAISettingsSchema } from "./workspaceAiSettings";
+import { TASK_GROUP_KIND_VALUES } from "@/common/utils/tools/taskGroups";
 
 export const ProjectRefSchema = z.object({
   projectPath: z.string().meta({ description: "Absolute path to the project's main git repo" }),
   projectName: z
     .string()
     .meta({ description: "Display name for the project (typically derived from projectPath)" }),
+});
+
+export const BestOfGroupSchema = z.object({
+  groupId: z.string().meta({
+    description:
+      "Stable identifier shared by sibling task workspaces spawned from the same grouped task request.",
+  }),
+  index: z.number().int().min(0).meta({
+    description: "Zero-based sibling index within the grouped task request.",
+  }),
+  total: z.number().int().min(2).meta({
+    description: "Total number of sibling tasks spawned in the grouped task request.",
+  }),
+  kind: z.enum(TASK_GROUP_KIND_VALUES).optional().meta({
+    description:
+      'Optional grouped task mode ("bestOf" for repeated candidates or "variants" for labeled siblings). Missing values default to "bestOf" at read time for backward compatibility.',
+  }),
+  label: z.string().min(1).optional().meta({
+    description: "Optional per-sibling label for grouped task variants.",
+  }),
 });
 
 export const WorkspaceMetadataSchema = z.object({
@@ -51,6 +72,9 @@ export const WorkspaceMetadataSchema = z.object({
   agentId: z.string().optional().meta({
     description:
       'If set, selects an agent definition for this workspace (e.g., "explore" or "exec").',
+  }),
+  bestOf: BestOfGroupSchema.optional().meta({
+    description: "Grouping metadata for child tasks spawned from the same parent tool call.",
   }),
   taskStatus: z
     .enum(["queued", "running", "awaiting_report", "interrupted", "reported"])
@@ -132,6 +156,9 @@ export const WorkspaceAgentStatusSchema = z.object({
 export const WorkspaceActivitySnapshotSchema = z.object({
   recency: z.number().meta({ description: "Unix ms timestamp of last user interaction" }),
   streaming: z.boolean().meta({ description: "Whether workspace currently has an active stream" }),
+  streamingGeneration: z.number().optional().meta({
+    description: "Monotonic stream generation counter for distinguishing newer background turns",
+  }),
   lastModel: z.string().nullable().meta({ description: "Last model sent from this workspace" }),
   lastThinkingLevel: ThinkingLevelSchema.nullable().meta({
     description: "Last thinking/reasoning level used in this workspace",

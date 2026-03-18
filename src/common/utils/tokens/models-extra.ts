@@ -33,11 +33,10 @@ interface ModelData {
 
 export const modelsExtra: Record<string, ModelData> = {
   // Claude Opus 4.6 - Released February 2026
-  // Standard: $5/M input, $25/M output (≤200k context)
-  // Premium (1M context): $10/M input, $37.50/M output
-  // 128K max output tokens
+  // Native 1M context at standard pricing: $5/M input, $25/M output.
+  // 128K max output tokens.
   "claude-opus-4-6": {
-    max_input_tokens: 200000,
+    max_input_tokens: 1000000,
     max_output_tokens: 128000,
     input_cost_per_token: 0.000005, // $5 per million input tokens
     output_cost_per_token: 0.000025, // $25 per million output tokens
@@ -54,10 +53,10 @@ export const modelsExtra: Record<string, ModelData> = {
   },
 
   // Claude Sonnet 4.6 - Released February 2026
-  // $3/M input, $15/M output (same as Sonnet 4.5)
-  // 64K max output tokens, supports adaptive thinking + effort parameter
+  // Native 1M context at standard pricing: $3/M input, $15/M output.
+  // 64K max output tokens, supports adaptive thinking + effort parameter.
   "claude-sonnet-4-6": {
-    max_input_tokens: 200000,
+    max_input_tokens: 1000000,
     max_output_tokens: 64000,
     input_cost_per_token: 0.000003, // $3 per million input tokens
     output_cost_per_token: 0.000015, // $15 per million output tokens
@@ -107,6 +106,42 @@ export const modelsExtra: Record<string, ModelData> = {
     cache_read_input_token_cost_above_200k_tokens: 0.0000005, // $0.50 per million cached input tokens (>272K)
     // OpenAI's published long-context boundary is 272K even though LiteLLM's field names say 200K.
     tiered_pricing_threshold_tokens: 272000,
+    litellm_provider: "openai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    knowledge_cutoff: "2025-08-31",
+  },
+
+  // GPT-5.4 mini - Released March 11, 2026
+  // Smaller/faster GPT-5.4 tier with 400K context, 128K max output, and published
+  // pricing of $0.75/M input, $4.50/M output, and $0.075/M cached input.
+  "gpt-5.4-mini": {
+    max_input_tokens: 400000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.00000075, // $0.75 per million input tokens
+    output_cost_per_token: 0.0000045, // $4.50 per million output tokens
+    cache_read_input_token_cost: 0.000000075, // $0.075 per million cached input tokens
+    litellm_provider: "openai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    knowledge_cutoff: "2025-08-31",
+  },
+
+  // GPT-5.4 nano - Released March 17, 2026
+  // Cheapest GPT-5.4-class tier with 400K context, 128K max output, and published
+  // pricing of $0.20/M input, $1.25/M output, and $0.02/M cached input.
+  "gpt-5.4-nano": {
+    max_input_tokens: 400000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.0000002, // $0.20 per million input tokens
+    output_cost_per_token: 0.00000125, // $1.25 per million output tokens
+    cache_read_input_token_cost: 0.00000002, // $0.02 per million cached input tokens
     litellm_provider: "openai",
     mode: "chat",
     supports_function_calling: true,

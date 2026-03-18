@@ -214,6 +214,177 @@ export const ManyWorkspaces: AppStory = {
 };
 
 /**
+ * Best-of-n sub-agents are coalesced into a single expandable sidebar row.
+ */
+export const BestOfSubagents: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const projectPath = "/home/user/projects/best-of-demo";
+        const parent = createWorkspace({
+          id: "ws-parent",
+          name: "main",
+          title: "Main workspace",
+          projectName: "best-of-demo",
+          projectPath,
+        });
+        const bestOfBase = { groupId: "best-of-story", index: 0, total: 4 } as const;
+        const workspaces = [
+          parent,
+          createWorkspace({
+            id: "ws-best-of-1",
+            name: "best-of-1",
+            title: "Compare sidebar grouping approaches",
+            projectName: "best-of-demo",
+            projectPath,
+            bestOf: bestOfBase,
+          }),
+          createWorkspace({
+            id: "ws-best-of-2",
+            name: "best-of-2",
+            title: "Compare sidebar grouping approaches",
+            projectName: "best-of-demo",
+            projectPath,
+            bestOf: { ...bestOfBase, index: 1 },
+          }),
+          createWorkspace({
+            id: "ws-best-of-3",
+            name: "best-of-3",
+            title: "Compare sidebar grouping approaches",
+            projectName: "best-of-demo",
+            projectPath,
+            bestOf: { ...bestOfBase, index: 2 },
+          }),
+          createWorkspace({
+            id: "ws-best-of-4",
+            name: "best-of-4",
+            title: "Compare sidebar grouping approaches",
+            projectName: "best-of-demo",
+            projectPath,
+            bestOf: { ...bestOfBase, index: 3 },
+          }),
+        ].map((workspace, index) =>
+          index === 0
+            ? workspace
+            : {
+                ...workspace,
+                parentWorkspaceId: parent.id,
+                taskStatus: index % 2 === 0 ? ("queued" as const) : ("running" as const),
+              }
+        );
+
+        expandProjects([projectPath]);
+
+        return createMockORPCClient({
+          projects: groupWorkspacesByProject(workspaces),
+          workspaces,
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    await waitFor(() => {
+      const groupRow = canvasElement.querySelector('[data-testid="task-group-best-of-story"]');
+      if (!groupRow) {
+        throw new Error("Best-of sidebar group row not rendered");
+      }
+    });
+
+    const groupRow = canvasElement.querySelector<HTMLElement>(
+      '[data-testid="task-group-best-of-story"]'
+    );
+    if (!groupRow) {
+      throw new Error("Best-of sidebar group row not found");
+    }
+    await userEvent.click(groupRow);
+
+    await waitFor(() => {
+      const member = canvasElement.querySelector('[data-workspace-id="ws-best-of-1"]');
+      if (!member) {
+        throw new Error("Expanded best-of member row not rendered");
+      }
+    });
+  },
+};
+
+/**
+ * Variant sub-agents reuse the grouped sidebar row but show a variants label.
+ */
+export const VariantSubagents: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const projectPath = "/home/user/projects/variants-demo";
+        const parent = createWorkspace({
+          id: "ws-parent-variants",
+          name: "main",
+          title: "Main workspace",
+          projectName: "variants-demo",
+          projectPath,
+        });
+        const taskGroupBase = {
+          groupId: "variants-story",
+          index: 0,
+          total: 3,
+          kind: "variants",
+          label: "frontend",
+        } as const;
+        const workspaces = [
+          parent,
+          createWorkspace({
+            id: "ws-variant-1",
+            name: "variant-1",
+            title: "Split review",
+            projectName: "variants-demo",
+            projectPath,
+            bestOf: taskGroupBase,
+          }),
+          createWorkspace({
+            id: "ws-variant-2",
+            name: "variant-2",
+            title: "Split review",
+            projectName: "variants-demo",
+            projectPath,
+            bestOf: { ...taskGroupBase, index: 1, label: "backend" },
+          }),
+          createWorkspace({
+            id: "ws-variant-3",
+            name: "variant-3",
+            title: "Split review",
+            projectName: "variants-demo",
+            projectPath,
+            bestOf: { ...taskGroupBase, index: 2, label: "tests" },
+          }),
+        ].map((workspace, index) =>
+          index === 0
+            ? workspace
+            : {
+                ...workspace,
+                parentWorkspaceId: parent.id,
+                taskStatus: index % 2 === 0 ? ("queued" as const) : ("running" as const),
+              }
+        );
+
+        expandProjects([projectPath]);
+
+        return createMockORPCClient({
+          projects: groupWorkspacesByProject(workspaces),
+          workspaces,
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    await waitFor(() => {
+      const groupRow = canvasElement.querySelector('[data-testid="task-group-variants-story"]');
+      if (!groupRow) {
+        throw new Error("Variants sidebar group row not rendered");
+      }
+    });
+  },
+};
+
+/**
  * Regression test: when all workspaces are older than 1 day, they should still
  * appear under the "Older than 1 day" tier instead of being forced into recent.
  * Also verifies expanded parent rows can reveal both active and completed sub-agents.

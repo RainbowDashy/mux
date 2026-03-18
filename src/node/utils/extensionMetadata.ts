@@ -1,6 +1,7 @@
 import { readFileSync, existsSync } from "fs";
 
 import { getMuxExtensionMetadataPath } from "@/common/constants/paths";
+import type { WorkspaceActivitySnapshot } from "@/common/types/workspace";
 import { isThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 import { log } from "@/node/services/log";
 
@@ -17,6 +18,7 @@ export interface ExtensionAgentStatus {
 export interface ExtensionMetadata {
   recency: number;
   streaming: boolean;
+  streamingGeneration?: number;
   lastModel: string | null;
   lastThinkingLevel: ThinkingLevel | null;
   agentStatus: ExtensionAgentStatus | null;
@@ -66,6 +68,46 @@ export function coerceStatusUrl(url: unknown): string | null {
   return typeof url === "string" ? url : null;
 }
 
+export function coerceExtensionMetadata(value: unknown): ExtensionMetadata | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  if (typeof record.recency !== "number" || typeof record.streaming !== "boolean") {
+    return null;
+  }
+
+  return {
+    recency: record.recency,
+    streaming: record.streaming,
+    ...(typeof record.streamingGeneration === "number"
+      ? { streamingGeneration: record.streamingGeneration }
+      : {}),
+    lastModel: typeof record.lastModel === "string" ? record.lastModel : null,
+    lastThinkingLevel: isThinkingLevel(record.lastThinkingLevel) ? record.lastThinkingLevel : null,
+    agentStatus: coerceAgentStatus(record.agentStatus),
+    ...(typeof record.hasTodos === "boolean" ? { hasTodos: record.hasTodos } : {}),
+    lastStatusUrl: coerceStatusUrl(record.lastStatusUrl),
+  };
+}
+
+export function toWorkspaceActivitySnapshot(
+  metadata: ExtensionMetadata
+): WorkspaceActivitySnapshot {
+  return {
+    recency: metadata.recency,
+    streaming: metadata.streaming,
+    ...(typeof metadata.streamingGeneration === "number"
+      ? { streamingGeneration: metadata.streamingGeneration }
+      : {}),
+    lastModel: metadata.lastModel ?? null,
+    lastThinkingLevel: metadata.lastThinkingLevel ?? null,
+    agentStatus: coerceAgentStatus(metadata.agentStatus),
+    ...(typeof metadata.hasTodos === "boolean" ? { hasTodos: metadata.hasTodos } : {}),
+  };
+}
+
 /**
  * Read extension metadata from JSON file.
  * Returns a map of workspace ID to metadata.
@@ -90,20 +132,10 @@ export function readExtensionMetadata(): Map<string, ExtensionMetadata> {
 
     const map = new Map<string, ExtensionMetadata>();
     for (const [workspaceId, metadata] of Object.entries(data.workspaces || {})) {
-      const rawThinkingLevel = (metadata as { lastThinkingLevel?: unknown }).lastThinkingLevel;
-      const rawAgentStatus = (metadata as { agentStatus?: unknown }).agentStatus;
-      const rawLastStatusUrl = (metadata as { lastStatusUrl?: unknown }).lastStatusUrl;
-      map.set(workspaceId, {
-        recency: metadata.recency,
-        streaming: metadata.streaming,
-        lastModel: metadata.lastModel ?? null,
-        lastThinkingLevel: isThinkingLevel(rawThinkingLevel) ? rawThinkingLevel : null,
-        agentStatus: coerceAgentStatus(rawAgentStatus),
-        // Persisted metadata is loaded via JSON.parse without per-field validation,
-        // so only carry hasTodos forward when it is actually boolean.
-        ...(typeof metadata.hasTodos === "boolean" ? { hasTodos: metadata.hasTodos } : {}),
-        lastStatusUrl: coerceStatusUrl(rawLastStatusUrl),
-      });
+      const normalized = coerceExtensionMetadata(metadata);
+      if (normalized) {
+        map.set(workspaceId, normalized);
+      }
     }
 
     return map;

@@ -385,9 +385,9 @@ describe("buildProviderOptions - mappedToModel resolution", () => {
     });
   });
 
-  test("buildRequestHeaders resolves alias for 1M context header", () => {
+  test("buildRequestHeaders resolves alias for 1M beta context header", () => {
     const providersConfig = createMockProvidersConfig({
-      "anthropic:claude/sonnet": "anthropic:claude-sonnet-4-6-20251022",
+      "anthropic:claude/sonnet": "anthropic:claude-sonnet-4-5-20250929",
     });
 
     const result = buildRequestHeaders(
@@ -402,17 +402,17 @@ describe("buildProviderOptions - mappedToModel resolution", () => {
 });
 
 describe("isAnthropic1MEffectivelyEnabled", () => {
-  test("returns true for supported model with global 1M flag", () => {
+  test("returns true for beta-only Sonnet models with global 1M flag", () => {
     expect(
-      isAnthropic1MEffectivelyEnabled("anthropic:claude-opus-4-6", {
+      isAnthropic1MEffectivelyEnabled("anthropic:claude-sonnet-4-5", {
         anthropic: { use1MContext: true },
       })
     ).toBe(true);
   });
 
-  test("returns true when use1MContextModels includes an alias mapped to a 1M-capable model", () => {
+  test("returns true when use1MContextModels includes an alias mapped to a beta-only model", () => {
     const providersConfig = createMockProvidersConfig({
-      "anthropic:claude/sonnet": "anthropic:claude-sonnet-4-6-20251022",
+      "anthropic:claude/sonnet": "anthropic:claude-sonnet-4-5-20250929",
     });
 
     expect(
@@ -428,8 +428,16 @@ describe("isAnthropic1MEffectivelyEnabled", () => {
 
   test("returns false when beta features are disabled", () => {
     expect(
-      isAnthropic1MEffectivelyEnabled("anthropic:claude-opus-4-6", {
+      isAnthropic1MEffectivelyEnabled("anthropic:claude-sonnet-4-5", {
         anthropic: { use1MContext: true, disableBetaFeatures: true },
+      })
+    ).toBe(false);
+  });
+
+  test("returns false for native 1M models that no longer need the beta header", () => {
+    expect(
+      isAnthropic1MEffectivelyEnabled("anthropic:claude-opus-4-6", {
+        anthropic: { use1MContext: true },
       })
     ).toBe(false);
   });
@@ -444,26 +452,26 @@ describe("isAnthropic1MEffectivelyEnabled", () => {
 
   test("returns false when no 1M intent was provided", () => {
     expect(
-      isAnthropic1MEffectivelyEnabled("anthropic:claude-opus-4-6", {
+      isAnthropic1MEffectivelyEnabled("anthropic:claude-sonnet-4-5", {
         anthropic: {},
       })
     ).toBe(false);
   });
 
   test("returns false when provider options are missing", () => {
-    expect(isAnthropic1MEffectivelyEnabled("anthropic:claude-opus-4-6")).toBe(false);
+    expect(isAnthropic1MEffectivelyEnabled("anthropic:claude-sonnet-4-5")).toBe(false);
   });
 });
 
 describe("preserveAnthropic1MContextForFollowUp", () => {
-  test("preserves 1M for alias source model when providersConfig resolves to 1M-capable model", () => {
+  test("preserves beta 1M for alias source model when providersConfig resolves to a beta-only model", () => {
     const providersConfig = createMockProvidersConfig({
-      "anthropic:claude/sonnet": "anthropic:claude-sonnet-4-6-20251022",
+      "anthropic:claude/sonnet": "anthropic:claude-sonnet-4-5-20250929",
     });
 
     const result = preserveAnthropic1MContextForFollowUp(
       "anthropic:claude/sonnet",
-      "anthropic:claude-sonnet-4-6",
+      "anthropic:claude-sonnet-4-5",
       {
         anthropic: {
           use1MContextModels: ["anthropic:claude/sonnet"],
@@ -475,10 +483,10 @@ describe("preserveAnthropic1MContextForFollowUp", () => {
     expect(result?.anthropic?.use1MContext).toBe(true);
   });
 
-  test("does not preserve 1M for alias source model without providersConfig", () => {
+  test("does not preserve beta 1M for alias source model without providersConfig", () => {
     const result = preserveAnthropic1MContextForFollowUp(
       "anthropic:claude/sonnet",
-      "anthropic:claude-sonnet-4-6",
+      "anthropic:claude-sonnet-4-5",
       {
         anthropic: {
           use1MContextModels: ["anthropic:claude/sonnet"],
@@ -538,7 +546,27 @@ describe("buildProviderOptions - OpenAI", () => {
   });
 
   describe("promptCacheKey derivation", () => {
-    test("should derive promptCacheKey from workspaceId when provided", () => {
+    test("should prefer promptCacheScope over workspaceId for promptCacheKey", () => {
+      const result = buildProviderOptions(
+        "openai:gpt-5.2",
+        "off",
+        undefined,
+        undefined,
+        undefined,
+        "workspace-abc123",
+        undefined,
+        undefined,
+        undefined,
+        "my-project-deadbeef"
+      );
+      const openai = getOpenAIOptions(result);
+
+      expect(openai).toBeDefined();
+      expect(openai!.promptCacheKey).toBe("mux-v1-my-project-deadbeef");
+      expect(openai!.truncation).toBe("disabled");
+    });
+
+    test("should fall back to workspaceId when projectName is not provided", () => {
       const result = buildProviderOptions(
         "openai:gpt-5.2",
         "off",
@@ -569,19 +597,23 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(openai).toBeDefined();
       expect(openai!.truncation).toBe("auto");
     });
-    test("should derive promptCacheKey for gateway OpenAI model", () => {
+    test("should derive promptCacheKey for gateway OpenAI model with promptCacheScope", () => {
       const result = buildProviderOptions(
         "mux-gateway:openai/gpt-5.2",
         "off",
         undefined,
         undefined,
         undefined,
-        "workspace-xyz"
+        "workspace-xyz",
+        undefined,
+        undefined,
+        undefined,
+        "gateway-project-cafebabe"
       );
       const openai = getOpenAIOptions(result);
 
       expect(openai).toBeDefined();
-      expect(openai!.promptCacheKey).toBe("mux-v1-workspace-xyz");
+      expect(openai!.promptCacheKey).toBe("mux-v1-gateway-project-cafebabe");
       expect(openai!.truncation).toBe("disabled");
     });
   });
@@ -799,29 +831,36 @@ describe("buildProviderOptions - OpenAI", () => {
 });
 
 describe("buildRequestHeaders", () => {
-  test("should return anthropic-beta header for Opus 4.6 with use1MContext", () => {
-    const result = buildRequestHeaders("anthropic:claude-opus-4-6", {
+  test("should return anthropic-beta header for beta-only Sonnet models with use1MContext", () => {
+    const result = buildRequestHeaders("anthropic:claude-sonnet-4-5", {
       anthropic: { use1MContext: true },
     });
     expect(result).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
   });
 
-  test("should return anthropic-beta header for gateway-routed Anthropic model", () => {
-    const result = buildRequestHeaders("mux-gateway:anthropic/claude-opus-4-6", {
+  test("should return anthropic-beta header for gateway-routed beta Anthropic model", () => {
+    const result = buildRequestHeaders("mux-gateway:anthropic/claude-sonnet-4-5", {
       anthropic: { use1MContext: true },
     });
     expect(result).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
+  });
+
+  test("should return undefined for native 1M Anthropic models even when use1MContext is set", () => {
+    const result = buildRequestHeaders("anthropic:claude-opus-4-6", {
+      anthropic: { use1MContext: true },
+    });
+    expect(result).toBeUndefined();
   });
 
   test("should return undefined when disableBetaFeatures is true even with use1MContext", () => {
-    const result = buildRequestHeaders("anthropic:claude-opus-4-6", {
+    const result = buildRequestHeaders("anthropic:claude-sonnet-4-5", {
       anthropic: { use1MContext: true, disableBetaFeatures: true },
     });
     expect(result).toBeUndefined();
   });
 
   test("should still return header when disableBetaFeatures is false", () => {
-    const result = buildRequestHeaders("anthropic:claude-opus-4-6", {
+    const result = buildRequestHeaders("anthropic:claude-sonnet-4-5", {
       anthropic: { use1MContext: true, disableBetaFeatures: false },
     });
     expect(result).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
@@ -835,7 +874,7 @@ describe("buildRequestHeaders", () => {
   });
 
   test("should return undefined when use1MContext is false", () => {
-    const result = buildRequestHeaders("anthropic:claude-opus-4-6", {
+    const result = buildRequestHeaders("anthropic:claude-sonnet-4-5", {
       anthropic: { use1MContext: false },
     });
     expect(result).toBeUndefined();
@@ -857,7 +896,7 @@ describe("buildRequestHeaders", () => {
 
   test("should include both X-Mux-Workspace-Id and anthropic-beta when both apply", () => {
     const result = buildRequestHeaders(
-      "anthropic:claude-opus-4-6",
+      "anthropic:claude-sonnet-4-20250514",
       { anthropic: { use1MContext: true } },
       "a1b2c3d4e5"
     );
@@ -867,7 +906,7 @@ describe("buildRequestHeaders", () => {
     });
   });
 
-  test("should include X-Mux-Workspace-Id but not anthropic-beta for Anthropic without 1M context", () => {
+  test("should include X-Mux-Workspace-Id but not anthropic-beta for Anthropic without beta 1M intent", () => {
     const result = buildRequestHeaders(
       "anthropic:claude-sonnet-4-20250514",
       undefined,
@@ -882,12 +921,11 @@ describe("buildRequestHeaders", () => {
   });
 
   test("should return undefined when no muxProviderOptions provided", () => {
-    const result = buildRequestHeaders("anthropic:claude-opus-4-6");
+    const result = buildRequestHeaders("anthropic:claude-sonnet-4-5");
     expect(result).toBeUndefined();
   });
 
   test("should return undefined for unsupported model even with use1MContext", () => {
-    // claude-opus-4-1 doesn't support 1M context
     const result = buildRequestHeaders("anthropic:claude-opus-4-1", {
       anthropic: { use1MContext: true },
     });
@@ -895,8 +933,8 @@ describe("buildRequestHeaders", () => {
   });
 
   test("should return header when model is in use1MContextModels list", () => {
-    const result = buildRequestHeaders("anthropic:claude-opus-4-6", {
-      anthropic: { use1MContextModels: ["anthropic:claude-opus-4-6"] },
+    const result = buildRequestHeaders("anthropic:claude-sonnet-4-5", {
+      anthropic: { use1MContextModels: ["anthropic:claude-sonnet-4-5"] },
     });
     expect(result).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
   });
