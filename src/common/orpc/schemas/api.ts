@@ -1189,7 +1189,6 @@ export const workspace = {
       // (without shell interpolation) and falls back to shell-quoted argv for remote runtimes.
       command: z.string().nullish(),
       args: z.array(z.string()).nullish(),
-      executionTarget: z.enum(["runtime", "host-workspace"]).nullish(),
       options: z
         .object({
           timeout_secs: z.number().nullish(),
@@ -2355,8 +2354,9 @@ export const desktop = {
     input: z.object({ workspaceId: z.string() }),
     output: z.object({
       capability: DesktopCapabilitySchema,
-      bridgePort: z.number().int().positive().optional(),
+      bridgePath: z.string().optional(),
       token: z.string().optional(),
+      localBridgeBaseUrl: z.string().optional(),
     }),
   },
 };

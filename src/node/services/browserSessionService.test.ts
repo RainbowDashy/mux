@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test, type Mock }
 import * as browserSessionBackendModule from "@/node/services/browserSessionBackend";
 import { getMuxBrowserSessionId } from "@/common/utils/browserSession";
 import type {
+  BrowserAction,
   BrowserInputEvent,
   BrowserSession,
   BrowserSessionEvent,
@@ -99,6 +100,89 @@ describe("BrowserSessionService.startSession", () => {
     expect(createdOptions[0].streamPort).toBe(streamPortRegistry.getReservedPort(workspaceId));
     expect(createdOptions[0].initialUrl).toBe("https://example.com");
     expect(createdOptions[0]).not.toHaveProperty("ownership");
+  });
+
+  test("retries once with a clean relaunch when stale attach metadata leaves the stream restart_required", async () => {
+    const workspaceId = "workspace-reattach";
+    let reservedPort: number | null = null;
+    let knownPort: number | null = 9223;
+    const streamPortRegistry = {
+      reservePort: mock(() => {
+        reservedPort = knownPort ?? 9333;
+        return Promise.resolve(reservedPort);
+      }),
+      releasePort: mock(() => {
+        reservedPort = null;
+        knownPort = null;
+      }),
+      isReservedPort: mock((_workspaceId: string, port: number) => reservedPort === port),
+      getKnownPort: mock(() => reservedPort ?? knownPort),
+    };
+    const createdOptions: browserSessionBackendModule.BrowserSessionBackendOptions[] = [];
+    const stopMocks: Array<ReturnType<typeof mock>> = [];
+    let startCount = 0;
+
+    const service = new BrowserSessionService({
+      streamPortRegistry,
+      createBackend: (options) => {
+        createdOptions.push(options);
+        startCount += 1;
+        if (startCount === 1) {
+          const stop = mock(() => {
+            options.onEnded(workspaceId);
+            return Promise.resolve();
+          });
+          stopMocks.push(stop);
+          return {
+            start: mock(() => {
+              const session = {
+                ...createLiveSession(workspaceId),
+                currentUrl: "https://attached.example.com",
+                title: "Attached page",
+                streamState: "restart_required" as const,
+                streamErrorMessage: "connect ECONNREFUSED 127.0.0.1:9223",
+                lastError: "connect ECONNREFUSED 127.0.0.1:9223",
+              };
+              options.onSessionUpdate(session);
+              return Promise.resolve(session);
+            }),
+            stop,
+          } as unknown as browserSessionBackendModule.BrowserSessionBackend;
+        }
+
+        return {
+          start: mock(() => {
+            const session = {
+              ...createLiveSession(workspaceId),
+              currentUrl: "https://attached.example.com",
+              title: "Attached page",
+              streamState: "live" as const,
+              streamErrorMessage: null,
+              lastError: null,
+            };
+            options.onSessionUpdate(session);
+            return Promise.resolve(session);
+          }),
+          stop: mock(() => {
+            options.onEnded(workspaceId);
+            return Promise.resolve();
+          }),
+        } as unknown as browserSessionBackendModule.BrowserSessionBackend;
+      },
+    });
+
+    const session = await service.startSession(workspaceId, {
+      initialUrl: "https://start.example.com",
+    });
+
+    expect(createdOptions).toHaveLength(2);
+    expect(createdOptions[0]?.streamPort).toBe(9223);
+    expect(createdOptions[0]?.initialUrl).toBe("https://start.example.com");
+    expect(createdOptions[1]?.streamPort).toBe(9333);
+    expect(createdOptions[1]?.initialUrl).toBe("https://attached.example.com");
+    expect(stopMocks[0]).toHaveBeenCalledTimes(1);
+    expect(session.streamState).toBe("live");
+    expect(session.currentUrl).toBe("https://attached.example.com");
   });
 });
 
@@ -429,6 +513,256 @@ describe("BrowserSessionService.sendInput", () => {
 
     expect(result).toEqual({ success: true });
     expect(service.getRecentActions(workspaceId)).toEqual([]);
+  });
+});
+
+describe("BrowserSessionService navigate action coalescing", () => {
+  const workspaceId = "workspace-navigate-coalescing";
+
+  function createNavigateAction(
+    overrides: Partial<BrowserAction> & { metadata?: Record<string, unknown> } = {}
+  ): BrowserAction {
+    const metadata = {
+      previousUrl: null,
+      currentUrl: "https://example.com/dashboard",
+      previousTitle: null,
+      title: "Dashboard",
+      ...(overrides.metadata ?? {}),
+    };
+
+    return {
+      id: "navigate-action-1",
+      type: "navigate",
+      description: "Dashboard",
+      timestamp: "2026-03-16T00:00:00.000Z",
+      ...overrides,
+      metadata,
+    };
+  }
+
+  function createClickAction(overrides: Partial<BrowserAction> = {}): BrowserAction {
+    return {
+      id: "click-action-1",
+      type: "click",
+      description: "Clicked submit",
+      timestamp: "2026-03-16T00:00:00.000Z",
+      metadata: {
+        source: "user-input",
+      },
+      ...overrides,
+    };
+  }
+
+  async function startServiceWithActionCapture(): Promise<{
+    service: BrowserSessionService;
+    emitAction: (action: BrowserAction) => void;
+  }> {
+    let backendOptions: browserSessionBackendModule.BrowserSessionBackendOptions | null = null;
+
+    const service = new BrowserSessionService({
+      createBackend: (options) => {
+        backendOptions = options;
+        return {
+          start: mock(() => Promise.resolve(createLiveSession(workspaceId))),
+          stop: mock(() => Promise.resolve()),
+          sendInput: mock(() => ({ success: true })),
+          navigate: mock(() => Promise.resolve({ success: true })),
+        } as unknown as browserSessionBackendModule.BrowserSessionBackend;
+      },
+    });
+
+    await service.startSession(workspaceId);
+    expect(backendOptions).not.toBeNull();
+
+    return {
+      service,
+      emitAction: (action) => {
+        expect(backendOptions).not.toBeNull();
+        backendOptions!.onAction(action);
+      },
+    };
+  }
+
+  test("coalesces same-url navigate actions within 2 seconds and keeps the latest metadata", async () => {
+    const { service, emitAction } = await startServiceWithActionCapture();
+    const actionEvents: BrowserSessionEvent[] = [];
+    service.on(`update:${workspaceId}`, (event: BrowserSessionEvent) => {
+      actionEvents.push(event);
+    });
+
+    const firstAction = createNavigateAction({
+      id: "navigate-action-1",
+      description: "Dashboard",
+      timestamp: "2026-03-16T00:00:00.000Z",
+      metadata: {
+        currentUrl: "https://example.com/dashboard",
+        title: "Dashboard",
+      },
+    });
+    const secondAction = createNavigateAction({
+      id: "navigate-action-2",
+      description: "Project dashboard",
+      timestamp: "2026-03-16T00:00:01.500Z",
+      metadata: {
+        previousUrl: "https://example.com/login",
+        currentUrl: "https://example.com/dashboard",
+        previousTitle: "Log in",
+        title: "Project dashboard",
+      },
+    });
+
+    emitAction(firstAction);
+    emitAction(secondAction);
+
+    const recentActions = service.getRecentActions(workspaceId);
+    expect(recentActions).toHaveLength(1);
+    expect(recentActions[0]).toMatchObject({
+      id: firstAction.id,
+      type: "navigate",
+      description: "Project dashboard",
+      timestamp: secondAction.timestamp,
+      metadata: {
+        previousUrl: "https://example.com/login",
+        currentUrl: "https://example.com/dashboard",
+        previousTitle: "Log in",
+        title: "Project dashboard",
+        navigateCount: 2,
+      },
+    });
+
+    const navigateActionEvents = actionEvents.filter(
+      (event): event is Extract<BrowserSessionEvent, { type: "action" }> => event.type === "action"
+    );
+    expect(navigateActionEvents).toHaveLength(2);
+    expect(navigateActionEvents[0]?.action.id).toBe(firstAction.id);
+    expect(navigateActionEvents[1]?.action.id).toBe(firstAction.id);
+    expect(navigateActionEvents[1]?.action.metadata).toMatchObject({ navigateCount: 2 });
+  });
+
+  test("does not coalesce same-url navigate actions when they are more than 2 seconds apart", async () => {
+    const { service, emitAction } = await startServiceWithActionCapture();
+
+    emitAction(
+      createNavigateAction({
+        id: "navigate-action-1",
+        timestamp: "2026-03-16T00:00:00.000Z",
+      })
+    );
+    emitAction(
+      createNavigateAction({
+        id: "navigate-action-2",
+        timestamp: "2026-03-16T00:00:02.100Z",
+      })
+    );
+
+    const recentActions = service.getRecentActions(workspaceId);
+    expect(recentActions).toHaveLength(2);
+    expect(recentActions[0]?.metadata).not.toHaveProperty("navigateCount");
+    expect(recentActions[1]?.metadata).not.toHaveProperty("navigateCount");
+  });
+
+  test("does not coalesce navigate actions for different destinations", async () => {
+    const { service, emitAction } = await startServiceWithActionCapture();
+
+    emitAction(
+      createNavigateAction({
+        id: "navigate-action-1",
+        timestamp: "2026-03-16T00:00:00.000Z",
+        metadata: {
+          currentUrl: "https://example.com/dashboard",
+          title: "Dashboard",
+        },
+      })
+    );
+    emitAction(
+      createNavigateAction({
+        id: "navigate-action-2",
+        timestamp: "2026-03-16T00:00:01.000Z",
+        description: "Settings",
+        metadata: {
+          previousUrl: "https://example.com/dashboard",
+          currentUrl: "https://example.com/settings",
+          previousTitle: "Dashboard",
+          title: "Settings",
+        },
+      })
+    );
+
+    const recentActions = service.getRecentActions(workspaceId);
+    expect(recentActions).toHaveLength(2);
+    expect(recentActions[0]?.metadata).not.toHaveProperty("navigateCount");
+    expect(recentActions[1]?.metadata).not.toHaveProperty("navigateCount");
+  });
+
+  test("does not coalesce navigate actions across non-navigate actions", async () => {
+    const { service, emitAction } = await startServiceWithActionCapture();
+
+    emitAction(
+      createNavigateAction({
+        id: "navigate-action-1",
+        timestamp: "2026-03-16T00:00:00.000Z",
+      })
+    );
+    emitAction(
+      createClickAction({
+        id: "click-action-1",
+        timestamp: "2026-03-16T00:00:00.500Z",
+      })
+    );
+    emitAction(
+      createNavigateAction({
+        id: "navigate-action-2",
+        timestamp: "2026-03-16T00:00:01.000Z",
+      })
+    );
+
+    const recentActions = service.getRecentActions(workspaceId);
+    expect(recentActions).toHaveLength(3);
+    expect(recentActions[0]?.type).toBe("navigate");
+    expect(recentActions[1]?.type).toBe("click");
+    expect(recentActions[2]?.type).toBe("navigate");
+  });
+
+  test("accumulates navigate counts across repeated merges", async () => {
+    const { service, emitAction } = await startServiceWithActionCapture();
+
+    emitAction(
+      createNavigateAction({
+        id: "navigate-action-1",
+        timestamp: "2026-03-16T00:00:00.000Z",
+      })
+    );
+    emitAction(
+      createNavigateAction({
+        id: "navigate-action-2",
+        timestamp: "2026-03-16T00:00:00.500Z",
+      })
+    );
+    emitAction(
+      createNavigateAction({
+        id: "navigate-action-3",
+        timestamp: "2026-03-16T00:00:01.000Z",
+        description: "Dashboard refreshed",
+        metadata: {
+          previousUrl: "https://example.com/dashboard",
+          currentUrl: "https://example.com/dashboard",
+          previousTitle: "Dashboard",
+          title: "Dashboard refreshed",
+        },
+      })
+    );
+
+    const recentActions = service.getRecentActions(workspaceId);
+    expect(recentActions).toHaveLength(1);
+    expect(recentActions[0]).toMatchObject({
+      id: "navigate-action-1",
+      description: "Dashboard refreshed",
+      timestamp: "2026-03-16T00:00:01.000Z",
+      metadata: {
+        navigateCount: 3,
+        title: "Dashboard refreshed",
+      },
+    });
   });
 });
 
